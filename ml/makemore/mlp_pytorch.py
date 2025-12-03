@@ -39,6 +39,7 @@ model = nn.Sequential(
     nn.Linear(                  N_HIDDEN, N_HIDDEN, bias=False), nn.BatchNorm1d(N_HIDDEN), nn.Tanh(),
     nn.Linear(                  N_HIDDEN, ALPHABET_SIZE)
 )
+print(f"Number of parameters: {len(model.parameters())}")
 
 optimizer = optim.Adam(params=model.parameters(), lr=1e-3)
 
@@ -61,7 +62,7 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-        # Store loss
+        # Loss statistics
         running_loss += loss.item()
         epoch_loss += loss.item()
         if i % 100 == 99:
