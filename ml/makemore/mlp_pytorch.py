@@ -96,7 +96,7 @@ class MLP(nn.Module):
         output_layer = [
             nn.Linear(
                 in_features=last_hidden_layer_fanin,
-                out_features=config.vocab_size+1,  # output prob. distribution over all characters in vocab
+                out_features=config.vocab_size + 1,  # output prob. distribution over all characters in vocab
                 bias=True,  # no batch norm in output layer
             )
         ]
