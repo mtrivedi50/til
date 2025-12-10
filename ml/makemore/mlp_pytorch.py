@@ -4,11 +4,14 @@ Run from root directory using:
 uv run python -m ml.makemore.mlp_pytorch
 """
 
-from torch import nn
+from pydantic import BaseModel, Field, model_validator
+
+from torch import nn, Tensor
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
+from typing import Any
 
 from ml.makemore.utils import (
     load_dataset,
@@ -16,61 +19,167 @@ from ml.makemore.utils import (
 )
 
 
-# Constants
-BLOCK_SIZE = 8  # number of characters to use as context
-ALPHABET_SIZE = 27  # size of alphabet
-EMBEDDING_DIM = 10  # dimension for each embedding space (for each character)
-N_HIDDEN = 100  # number of neurons in fully-connected layer
+class MLPConfig(BaseModel):
+    n_hidden_layers: int = Field(
+        description="Number of hidden layers. Note this does not include the input layer."
+    )
+    n_hidden: list[int] = Field(
+        description=" ".join([
+            "Number of neurons in hidden layers. If a list, then the length must be equal to `n_hidden_layers`.",
+            "If constant, then all hidden layers will have the same number of neurons."
+        ])
+    )
+    context_len: int = Field(
+        description="Number of characters to use as context."
+    )
+    vocab_size: int = Field(
+        description="Number of characters in the vocabulary.",
+        default=26
+    )
+    embedding_dim: int = Field(
+        description="Size of character embedding."
+    )
+    bias: bool = Field(
+        description="Learn bias for each linear layer. Default is False, because our default behavior is to add batch norm layers.",
+        default=False
+    )
+    batch_norm: bool = Field(
+        description="Add batch norm layers after each linear layer. Default is True.",
+        default=True
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_n_hidden_to_list(cls, data: dict[str, Any]):
+        if isinstance(data, dict):
+            flag_n_hidden = "n_hidden" in data and isinstance(data["n_hidden"], int)
+            flag_n_hidden_layers = "n_hidden_layers" in data and isinstance(data["n_hidden_layers"], int)
+            if flag_n_hidden and flag_n_hidden_layers:
+                n_hidden_list = [data["n_hidden"]] * data["n_hidden_layers"]
+                data["n_hidden"] = n_hidden_list
+        return data
+
+    @model_validator(mode="after")
+    def validate(self) -> "MLPConfig":
+        if isinstance(self.n_hidden, list):
+            if len(self.n_hidden) == 0:
+                raise ValueError("n_hidden cannot be an empty list!")
+            if len(self.n_hidden) != self.n_hidden_layers:
+                raise ValueError("n_hidden is a list, but its length does not equal `n_hidden_layers`!")
+        return self
 
 
-# Training data
-names, chars_to_i = load_dataset()
-all_datasets = build_datasets(names, chars_to_i, BLOCK_SIZE)
-training_loader = DataLoader(dataset=all_datasets["train"], batch_size=64, shuffle=True)
+
+class MLP(nn.Module):
+
+    def __init__(self, config: MLPConfig):
+        super().__init__()
+
+        self.embedding = nn.Embedding(config.vocab_size + 1, config.embedding_dim)
+        
+        # Input layer
+        first_hidden_layer_fanin = config.n_hidden[0]
+        input_layer = [
+            nn.Linear(
+                in_features=config.context_len * config.embedding_dim,
+                out_features=first_hidden_layer_fanin,
+                bias=config.bias
+            )
+        ]
+        if config.batch_norm:
+            input_layer.append(
+                nn.BatchNorm1d(first_hidden_layer_fanin)
+            )
+        input_layer.append(nn.Tanh())
+
+        # Output layer
+        last_hidden_layer_fanin = config.n_hidden[-1]
+        output_layer = [
+            nn.Linear(
+                in_features=last_hidden_layer_fanin,
+                out_features=config.vocab_size+1,  # output prob. distribution over all characters in vocab
+                bias=True,  # no batch norm in output layer
+            )
+        ]
+
+        # Hidden layers
+        hidden_layers = []
+        for fanin, fanout in zip(config.n_hidden, config.n_hidden[1:]):
+            hidden_layers.append(
+                nn.Linear(
+                    in_features=fanin,
+                    out_features=fanout,
+                    bias=config.bias
+                )
+            )
+            # Batch norm
+            if config.batch_norm:
+                hidden_layers.append(
+                    nn.BatchNorm1d(fanout)
+                )
+            # Non-linearity
+            hidden_layers.append(nn.Tanh())
+        
+        self.layers = nn.Sequential(*(input_layer + hidden_layers + output_layer))
+
+    def forward(self, x: Tensor, targets: Tensor | None = None):
+        # Each row of input is a series of indices representing context characters
+        emb = self.embedding(x.int()).view(x.size()[0], -1)
+        logits = self.layers(emb)
+        if targets is not None:
+            loss = F.cross_entropy(logits, targets)
+        else:
+            loss = None
+        return logits, loss
 
 
-# Model
-model = nn.Sequential(
-    nn.Embedding(num_embeddings=ALPHABET_SIZE, embedding_dim=EMBEDDING_DIM),
-    nn.Flatten(),
-    nn.Linear(BLOCK_SIZE * EMBEDDING_DIM, N_HIDDEN, bias=False), nn.BatchNorm1d(N_HIDDEN), nn.Tanh(),
-    nn.Linear(                  N_HIDDEN, N_HIDDEN, bias=False), nn.BatchNorm1d(N_HIDDEN), nn.Tanh(),
-    nn.Linear(                  N_HIDDEN, N_HIDDEN, bias=False), nn.BatchNorm1d(N_HIDDEN), nn.Tanh(),
-    nn.Linear(                  N_HIDDEN, N_HIDDEN, bias=False), nn.BatchNorm1d(N_HIDDEN), nn.Tanh(),
-    nn.Linear(                  N_HIDDEN, ALPHABET_SIZE)
-)
-print(f"Number of parameters: {len(model.parameters())}")
+if __name__ == "__main__":
+    # Use 8 characters for context length
+    CONTEXT_LENGTH = 8
 
-optimizer = optim.Adam(params=model.parameters(), lr=1e-3)
+    # Training data
+    names, chars_to_i = load_dataset()
+    all_datasets = build_datasets(names, chars_to_i, CONTEXT_LENGTH)
+    training_loader = DataLoader(dataset=all_datasets["train"], batch_size=64, shuffle=True)
 
-num_epochs = 5
-avg_loss_epochs = []
-for epoch in range(num_epochs):
-    running_loss = 0
-    epoch_loss = 0
+    # Model
+    config = MLPConfig(
+        n_hidden_layers=4,
+        n_hidden=100,
+        context_len=CONTEXT_LENGTH,
+        embedding_dim=10
+    )
+    mlp = MLP(config)
+    optimizer = optim.Adam(params=mlp.parameters(), lr=1e-3)
 
-    # Batch. As opposed to manually defining batches, use DataLoader class. This also
-    # shuffles the rows for each epoch.
-    for i, (x, y) in enumerate(training_loader):
-        optimizer.zero_grad()
+    # Training
+    num_epochs = 5
+    avg_loss_epochs = []
+    for epoch in range(num_epochs):
+        running_loss = 0
+        epoch_loss = 0
 
-        # Forward
-        logits = model(x)
-        loss = F.cross_entropy(logits, y)
+        # Batch. As opposed to manually defining batches, use DataLoader class. This also
+        # shuffles the rows for each epoch.
+        for i, (x, y) in enumerate(training_loader):
+            optimizer.zero_grad()
 
-        # Backward
-        loss.backward()
-        optimizer.step()
+            # Forward
+            logits, loss = mlp(x, y)
 
-        # Loss statistics
-        running_loss += loss.item()
-        epoch_loss += loss.item()
-        if i % 100 == 99:
-            print(f"Epoch {epoch}, batch {i+1}: average loss: {(running_loss / 100):.4f}")
-            running_loss = 0
+            # Backward
+            loss.backward()
+            optimizer.step()
 
-    avg_loss_epochs.append(epoch_loss / len(training_loader))
+            # Loss statistics
+            running_loss += loss.item()
+            epoch_loss += loss.item()
+            if i % 100 == 99:
+                print(f"Epoch {epoch}, batch {i+1}: average loss: {(running_loss / 100):.4f}")
+                running_loss = 0
 
+        avg_loss_epochs.append(epoch_loss / len(training_loader))
 
-plt.plot(range(num_epochs), avg_loss_epochs)
-plt.show()
+    # Loss plot
+    plt.plot(range(num_epochs), avg_loss_epochs)
+    plt.show()
