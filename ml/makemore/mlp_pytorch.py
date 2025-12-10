@@ -69,7 +69,6 @@ class MLPConfig(BaseModel):
         return self
 
 
-
 class MLP(nn.Module):
 
     def __init__(self, config: MLPConfig):
