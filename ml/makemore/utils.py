@@ -1,5 +1,6 @@
 from pathlib import Path
 import torch
+from torch import nn
 import random
 
 
@@ -68,3 +69,5 @@ def build_datasets(names: list[str], chars_to_i: dict[str, int], block_size: int
             "test": (Xtest, Ytest)
         }
 
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
