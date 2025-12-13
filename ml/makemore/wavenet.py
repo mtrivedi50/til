@@ -59,7 +59,7 @@ class WavenetConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def define_layer_configs(self) -> "WavenetConfig":
+    def validate_context_length(self) -> "WavenetConfig":
         # context_len must be a power of two
         if math.log(self.context_len, 2) % 1 > 0:
             raise Exception("`context_len` must be a power of 2!")    
