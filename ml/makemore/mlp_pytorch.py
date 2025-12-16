@@ -21,7 +21,7 @@ from ml.makemore.utils import (
 
 class MLPConfig(BaseModel):
     n_hidden_layers: int = Field(
-        description="Number of hidden layers. Note this does not include the input layer."
+        description="Number of hidden layers."
     )
     n_hidden: list[int] = Field(
         description=" ".join([
@@ -76,55 +76,34 @@ class MLP(nn.Module):
 
         self.embedding = nn.Embedding(config.vocab_size + 1, config.embedding_dim)
         
-        # Input layer
-        first_hidden_layer_fanin = config.n_hidden[0]
-        input_layer = [
-            nn.Linear(
-                in_features=config.context_len * config.embedding_dim,
-                out_features=first_hidden_layer_fanin,
-                bias=config.bias
+        # Hidden layers
+        self.layers = nn.ModuleList()
+        for i in range(config.n_hidden_layers-1):
+            if i == 0:
+                fanin = config.context_len * config.embedding_dim
+            else:
+                fanin = config.n_hidden[i]
+            
+            self.layers.append(
+                nn.Linear(fanin, config.n_hidden[i+1], config.bias), 
             )
-        ]
-        if config.batch_norm:
-            input_layer.append(
-                nn.BatchNorm1d(first_hidden_layer_fanin)
-            )
-        input_layer.append(nn.Tanh())
+            if config.batch_norm:
+                self.layers.append(nn.BatchNorm1d(config.n_hidden[i+1]))
 
         # Output layer
         last_hidden_layer_fanin = config.n_hidden[-1]
-        output_layer = [
-            nn.Linear(
-                in_features=last_hidden_layer_fanin,
-                out_features=config.vocab_size + 1,  # output prob. distribution over all characters in vocab
-                bias=True,  # no batch norm in output layer
-            )
-        ]
-
-        # Hidden layers
-        hidden_layers = []
-        for fanin, fanout in zip(config.n_hidden, config.n_hidden[1:]):
-            hidden_layers.append(
-                nn.Linear(
-                    in_features=fanin,
-                    out_features=fanout,
-                    bias=config.bias
-                )
-            )
-            # Batch norm
-            if config.batch_norm:
-                hidden_layers.append(
-                    nn.BatchNorm1d(fanout)
-                )
-            # Non-linearity
-            hidden_layers.append(nn.Tanh())
-        
-        self.layers = nn.Sequential(*(input_layer + hidden_layers + output_layer))
+        self.output_layer = nn.Linear(
+            in_features=last_hidden_layer_fanin,
+            out_features=config.vocab_size + 1,  # output prob. distribution over all characters in vocab
+            bias=True,  # no batch norm in output layer
+        )
 
     def forward(self, x: Tensor, targets: Tensor | None = None):
         # Each row of input is a series of indices representing context characters
-        emb = self.embedding(x.int()).view(x.size()[0], -1)
-        logits = self.layers(emb)
+        x = self.embedding(x.int()).view(x.size()[0], -1)
+        for layer in self.layers:
+            x = layer(x)
+        logits = self.output_layer(x)
         if targets is not None:
             loss = F.cross_entropy(logits, targets)
         else:

@@ -137,28 +137,25 @@ class Wavenet(nn.Module):
             self.layers.append(nn.Sequential(*cur))
 
         # Output layer
-        output_layer = nn.Linear(
+        self.output_layer = nn.Linear(
             in_features=config.n_hidden,
             out_features=config.vocab_size + 1,  # output prob. distribution over all characters in vocab
             bias=True,  # no batch norm in output layer
         )
-        self.layers.append(output_layer)
 
     def forward(self, x: Tensor, targets: Tensor | None = None):
         # Each row of input is a series of indices representing context characters
         x = self.embedding(x.long())
 
         # Forward pass
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             batch_size, context_len, embedding_len = x.shape
-
-            # At output, context_len will be 1. Ignore.
-            if i < len(self.layers)-1:
-                x = x.reshape((batch_size, context_len // 2, embedding_len * 2))
+            x = x.reshape((batch_size, context_len // 2, embedding_len * 2))
             x = layer(x)
 
         # Since context_len is 1, our shape will be (B, 1, C). Flatten the first
         # dimension.
+        x = self.output_layer(x)
         logits = x.flatten(start_dim=1)
         if targets is not None:
             loss = F.cross_entropy(logits, targets)
