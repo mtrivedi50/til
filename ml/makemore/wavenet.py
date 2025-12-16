@@ -20,16 +20,6 @@ from ml.makemore.utils import (
 )
 
 
-class LayerConfig(BaseModel):
-    """
-    Layer config. Because we are operating in 3 dimensions, helpful for keeping track of
-    the linear fanin and number of features of BatchNorm1d.
-    """
-    fanin_flattened: int
-    fanout: int
-    batch_norm_num_features: int
-
-
 class WavenetConfig(BaseModel):
     """
     Wavenet model: https://arxiv.org/pdf/1609.03499
@@ -65,62 +55,22 @@ class WavenetConfig(BaseModel):
             raise Exception("`context_len` must be a power of 2!")    
         return self
 
-    @property
-    def layer_configs(self) -> list[LayerConfig]:
-        # The number of batch-norm features changes for each layer. For 3D inputs (B x
-        # C x S), where B = batch length, C = context length, and S = sequence length,
-        # BatchNorm1d needs to have C inputs.
 
-        # Suppose B = 64, C = 8, S = 10
-        # Input Tensor: 64 x 8
-        # Embedding:
-        #   64 x 8 --> 64 x 8 x 10
-        # First Hidden layer
-        #   Flatten: 
-        #       64 x 8 x 10 --> 64 x 4 x 20
-        #   Linear: fanin=20, fanout=100
-        #       64 x 4 x 20 --> 64 x 4 x 100
-        #   BatchNorm1d: 4 features
-        # Second Hidden Layer:
-        #   FLatten:
-        #       64 x 4 x 100 --> 64 x 2 x 200
-        #   Linear: fanin=200, fanout=100
-        #       64 x 2 x 200 --> 64 x 2 x 100
-        #   BatchNorm: 2 features
-        # Third Hidden Layer:
-        #   FLatten:
-        #       64 x 2 x 100 --> 64 x 1 x 200
-        #   Linear: fanin=200, fanout=100
-        #       64 x 1 x 200 --> 64 x 1 x 100
-        #   BatchNorm: 1 features
-        # Output
-        #   FLatten:
-        #       64 x 1 x 200 --> 64 x 100
-        #   Linear: fanin=100, fanout=27
-        #       64 x 100 --> 64 x 27
-        
-        n_hidden_layers = int(math.log(self.context_len, 2))
-        layer_configs = []
-        for i in range(1, n_hidden_layers+1):
-            # Special case: i == 1. The first hidden layer accepts the first round of
-            # flattened embeddings.
-            if i == 1:
-                layer_configs.append(
-                    LayerConfig(
-                        fanin_flattened=self.embedding_dim*2,
-                        fanout=self.n_hidden,
-                        batch_norm_num_features=self.context_len // 2**(i)
-                    )
-                )
-            else:
-                layer_configs.append(
-                    LayerConfig(
-                        fanin_flattened=self.n_hidden*2,
-                        fanout=self.n_hidden,
-                        batch_norm_num_features=self.context_len // 2**(i)
-                    )
-                )
-        return layer_configs
+class LinearWithBatchNorm(nn.Module):
+
+    def __init__(self, fanin: int, fanout: int):
+        super().__init__()
+        self.fanin = fanin
+        self.fanout = fanout
+        self.linear = nn.Linear(fanin, fanout, False)
+        self.batch_norm = nn.BatchNorm1d(self.fanout)
+
+    def forward(self, x: Tensor):
+        x = self.linear(x)
+        x = x.transpose(1, 2)
+        x = self.batch_norm(x)
+        x = x.transpose(2, 1)
+        return x
 
 
 class Wavenet(nn.Module):
@@ -133,21 +83,56 @@ class Wavenet(nn.Module):
         # Embedding lookup table
         self.embedding = nn.Embedding(config.vocab_size + 1, config.embedding_dim)
 
-        # Hidden layers
+        # Hidden layers. We're working with two batch dimensions. The first batch
+        # dimension is the size of the training batch, the second batch dimension are
+        # the concatenated pairs of feature embeddings. Note that we need to be careful
+        # about how we move data between the linear layer and the BatchNorm1d layers.
+        
+        # Input Tensor: 64 x 8
+        # Embedding:
+        #   64 x 8 --> 64 x 8 x 10
+        # First Hidden layer
+        #   Flatten: 
+        #       64 x 8 x 10 --> 64 x 4 x 20
+        #   Linear: fanin=20, fanout=100
+        #       64 x 4 x 20 --> 64 x 4 x 100
+        #   BatchNorm1d: 100 features
+        # Second Hidden Layer:
+        #   FLatten:
+        #       64 x 4 x 100 --> 64 x 2 x 200
+        #   Linear: fanin=200, fanout=100
+        #       64 x 2 x 200 --> 64 x 2 x 100
+        #   BatchNorm: 100 features
+        # Third Hidden Layer:
+        #   FLatten:
+        #       64 x 2 x 100 --> 64 x 1 x 200
+        #   Linear: fanin=200, fanout=100
+        #       64 x 1 x 200 --> 64 x 1 x 100
+        #   BatchNorm: 100 features
+        # Output
+        #   FLatten:
+        #       64 x 1 x 200 --> 64 x 100
+        #   Linear: fanin=100, fanout=27
+        #       64 x 100 --> 64 x 27
+
         self.layers = nn.ModuleList()
-        for layer_config in config.layer_configs:
+        n_hidden_layers = int(math.log(self.context_len, 2))
+        for i in range(n_hidden_layers):
             cur = []
-            cur.append(
-                nn.Linear(
-                    in_features=layer_config.fanin_flattened,
-                    out_features=layer_config.fanout,
-                    bias=config.bias
-                )
-            )
+            # Special case: i == 0. The first hidden layer accepts the first round of
+            # flattened embeddings.
+            if i == 0:
+                fanin = config.embedding_dim*2
+            else:
+                fanin = config.n_hidden*2
+            
+            # Batch norm vs. regular linear layer
             if config.batch_norm:
                 cur.append(
-                    nn.BatchNorm1d(layer_config.batch_norm_num_features)
+                    LinearWithBatchNorm(fanin, config.n_hidden)
                 )
+            else:
+                cur.append(nn.Linear(fanin, config.n_hidden))
             cur.append(nn.Tanh())
             self.layers.append(nn.Sequential(*cur))
 
@@ -169,7 +154,7 @@ class Wavenet(nn.Module):
 
             # At output, context_len will be 1. Ignore.
             if i < len(self.layers)-1:
-                x = x.view((batch_size, context_len // 2, embedding_len * 2))
+                x = x.reshape((batch_size, context_len // 2, embedding_len * 2))
             x = layer(x)
 
         # Since context_len is 1, our shape will be (B, 1, C). Flatten the first
