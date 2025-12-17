@@ -4,21 +4,12 @@ Bigram-level character model. Run from root directory using:
 uv run python -m ml.bigram
 """
 
-from pydantic import BaseModel, Field, model_validator
-import math
-
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from torch import optim
-from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-from ml.makemore.utils import (
-    load_dataset,
-    build_datasets,
-    count_parameters,
-)
+from ml.makemore.utils import load_dataset
 
 
 class Bigram(nn.Module):
