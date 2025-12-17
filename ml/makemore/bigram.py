@@ -32,6 +32,20 @@ class Bigram(nn.Module):
             loss = F.cross_entropy(x, torch.Tensor(target))
         return x, loss
 
+    def generate(self, idx_to_chars: dict[int, str]) -> str:
+        # Start with the "." character, which represents start
+        idx = torch.tensor(0)
+        chars = []
+        while True:
+            logits, _ = self(idx)
+            prob = F.softmax(logits, dim=0)
+            sample_idx = torch.multinomial(prob, num_samples=1)[0]
+            next_char = idx_to_chars[sample_idx.item()]
+            if next_char == ".":
+                break
+            chars.append(next_char)
+            idx = sample_idx
+        return "".join(chars)
 
 if __name__ == "__main__":
     # Names dataset
@@ -92,3 +106,9 @@ if __name__ == "__main__":
     plt.plot(range(n), training_losses, color="blue", label="training")
     plt.plot(range(n), val_losses, color="red", label="validation")
     plt.show()
+
+    # Generate a new name
+    idx_to_chars = {i: c for c, i in chars_to_i.items()}
+    for _ in range(10):
+        new_name = model.generate(idx_to_chars)
+        print(f"New name: {new_name}")
