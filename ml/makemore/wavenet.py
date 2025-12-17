@@ -60,10 +60,8 @@ class LinearWithBatchNorm(nn.Module):
 
     def __init__(self, fanin: int, fanout: int):
         super().__init__()
-        self.fanin = fanin
-        self.fanout = fanout
         self.linear = nn.Linear(fanin, fanout, False)
-        self.batch_norm = nn.BatchNorm1d(self.fanout)
+        self.batch_norm = nn.BatchNorm1d(fanout)
 
     def forward(self, x: Tensor):
         x = self.linear(x)
@@ -175,17 +173,21 @@ if __name__ == "__main__":
 
     # Model
     config = WavenetConfig(
-        n_hidden=68,
+        n_hidden=128,
         context_len=CONTEXT_LENGTH,
-        embedding_dim=10
+        embedding_dim=24
     )
     model = Wavenet(config)
     print(f"Number of parameters: {count_parameters(model)}")
     optimizer = optim.Adam(params=model.parameters(), lr=1e-3)
 
+    # Validation loss
+    Xval, Yval = all_datasets["val"].data, all_datasets["val"].labels
+
     # Training
-    num_epochs = 5
+    num_epochs = 20
     avg_loss_epochs = []
+    val_loss_epochs = []
     for epoch in range(num_epochs):
         running_loss = 0
         epoch_loss = 0
@@ -208,8 +210,15 @@ if __name__ == "__main__":
             if i % 100 == 99:
                 print(f"Epoch {epoch}, batch {i+1}: average loss: {(running_loss / 100):.4f}")
                 running_loss = 0
+        
+        # Validation loss
+        _, val_loss = model(Xval, Yval)
+        val_loss_epochs.append(val_loss.item())
+        
         avg_loss_epochs.append(epoch_loss / len(training_loader))
 
     # Loss plot
-    plt.plot(range(num_epochs), avg_loss_epochs)
+    plt.plot(range(num_epochs), avg_loss_epochs, color='blue', label='training')
+    plt.plot(range(num_epochs), val_loss_epochs, color='red', label='validation')
     plt.show()
+

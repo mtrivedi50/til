@@ -130,9 +130,13 @@ if __name__ == "__main__":
     mlp = MLP(config)
     optimizer = optim.Adam(params=mlp.parameters(), lr=1e-3)
 
+    # Validation
+    Xval, Yval = all_datasets["val"].data, all_datasets["val"].labels
+
     # Training
-    num_epochs = 5
+    num_epochs = 10
     avg_loss_epochs = []
+    val_loss_epochs = []
     for epoch in range(num_epochs):
         running_loss = 0
         epoch_loss = 0
@@ -156,8 +160,14 @@ if __name__ == "__main__":
                 print(f"Epoch {epoch}, batch {i+1}: average loss: {(running_loss / 100):.4f}")
                 running_loss = 0
 
+        # Validation loss
+        _, val_loss = mlp(Xval, Yval)
+        val_loss_epochs.append(val_loss.item())
+
+        # Average loss over the epoch
         avg_loss_epochs.append(epoch_loss / len(training_loader))
 
     # Loss plot
-    plt.plot(range(num_epochs), avg_loss_epochs)
+    plt.plot(range(num_epochs), avg_loss_epochs, color='blue', label='training')
+    plt.plot(range(num_epochs), val_loss_epochs, color='red', label='validation')
     plt.show()
