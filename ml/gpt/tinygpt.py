@@ -59,7 +59,7 @@ class AttentionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        B, T, _ = x.shape
+        # x = (B, T, C), where C = config.n_embd
         k: torch.Tensor = self.keys(x)  # B, T, head_size
         q: torch.Tensor = self.queries(x)  # B, T, head_size
         wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, T, T
@@ -71,17 +71,6 @@ class AttentionHead(nn.Module):
         wei = F.softmax(wei, dim=-1)
         v: torch.Tensor = self.values(x)  # B, T, head_size
         out = wei @ v  # (B, T, T) @ (B, T, head_size) --> (B, T, head_size)
-
-        # Confirm shape
-        # TODO - delete later?
-        outB, outT, outC = out.shape
-        if outB != B:
-            raise Exception("Batch size after self-attention does not match input!")
-        if outT != T:
-            raise Exception("Feature length after self-attention does not match input!")
-        if outC != self.config.head_size:
-            raise Exception("Channel length after self-attention does not equal head size!")
-
         return out
 
 
@@ -160,4 +149,27 @@ class TinyGpt(nn.Module):
         logits = self.linear_head(self.ln(x))
 
         # Compute loss
-        # TODO
+        if y is not None:
+            B, T, C = logits.shape
+
+            # Flatten the logits. Each row is the last character before the target.
+            # e.g., if the sequence is "I am learning GPT", then the flatten operation
+            # results in a X, y pairing that looks like:
+            #   I --> _
+            #   _ --> a
+            #   a --> m
+            #   m --> _
+            #   _ --> l
+            #   l --> e
+            # ...
+            #
+            # This is intentional; with attention, the last character in our sequence
+            # should have absorbed all the necessary context from previous characters.
+
+            logits = logits.view(B*T, C)
+            y = y.view(B*T)
+            loss = F.cross_entropy(logits, y)
+        else:
+            loss = None
+    
+        return logits, loss
