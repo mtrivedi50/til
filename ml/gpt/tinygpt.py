@@ -57,7 +57,6 @@ class CasualSelfAttention(nn.Module):
         # Project n_embd to three vectors. We will split these and then make the number
         # of attention heads a batch dimension.
         self.kqv = nn.Linear(config.n_embd, config.n_embd*3, bias=False)
-        self.linear_head = nn.Linear(config.n_embd, config.n_embd)
 
         # Lower-triangular matrix for masking. Note viewing by 1,1,block_size,block_size
         # works because we broadcast into the 1 dimensions.
