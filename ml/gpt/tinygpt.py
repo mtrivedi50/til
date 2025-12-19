@@ -42,55 +42,47 @@ class TinyGptConfig(BaseModel):
         multi-attention, we concatenate all of the single-attention heads together,
         which means the final output is equal to `n_embd`.
         """
-        return self.n_embd // self.n_head
+        head_size = self.n_embd // self.n_head
+        if self.n_embd % self.n_head != 0:
+            raise Exception("`n_embd` must be divisible by `n_head`!")
+        return head_size
 
 
-class AttentionHead(nn.Module):
+class CasualSelfAttention(nn.Module):
 
     def __init__(self, config: TinyGptConfig):
         super().__init__()
         self.config = config
-        self.keys = nn.Linear(config.n_embd, config.head_size, bias=False)
-        self.queries = nn.Linear(config.n_embd, config.head_size, bias=False)
-        self.values = nn.Linear(config.n_embd, config.head_size, bias=False)
+
+        # Project n_embd to three vectors. We want the number of heads to be another
+        # batch dimension.
+        self.kqv = nn.Linear(config.n_embd, config.n_embd*3, bias=False)
+        self.linear_head = nn.Linear(config.n_embd, config.n_embd)
+
+        # Lower-triangular matrix for masking. Note viewing by 1,1,block_size,block_size
+        # works because we broadcast into the 1 dimensions.
         self.register_buffer(
             "tril",
-            torch.tril(torch.ones(config.block_size, config.block_size))
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
         )
 
     def forward(self, x: torch.Tensor):
         # x = (B, T, C), where C = config.n_embd
-        k: torch.Tensor = self.keys(x)  # B, T, head_size
-        q: torch.Tensor = self.queries(x)  # B, T, head_size
-        wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, T, T
+        B, T, C = x.shape
+        k, q, v = self.kqv(x).split(C, dim=-1)  # 3 tensors, each of B, T, C
+        k: torch.Tensor = k.view(B, T, self.config.n_head, self.config.head_size).transpose(-2, -1)  # B, nh, T, head_size
+        q: torch.Tensor = q.view(B, T, self.config.n_head, self.config.head_size).transpose(-2, -1)  # B, nh, T, head_size
+        v: torch.Tensor = v.view(B, T, self.config.n_head, self.config.head_size).transpose(-2, -1)  # B, nh, T, head_size
+        
+        wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, nh, T, T
 
         # Prevent positions from attending to subsequent positions.
-        wei = wei.masked_fill(self.tril == 0, float('-inf'))
+        wei = wei.masked_fill(self.tril[:,:,T,T] == 0, float('-inf')) # B, nh, T, T
 
-        # Output
+        # Softmax and output
         wei = F.softmax(wei, dim=-1)
-        v: torch.Tensor = self.values(x)  # B, T, head_size
-        out = wei @ v  # (B, T, T) @ (B, T, head_size) --> (B, T, head_size)
-        return out
-
-
-class MultiAttentionHead(nn.Module):
-
-    def __init__(self, config: TinyGptConfig):
-        super().__init__()
-        self.config = config
-        self.attention_heads = nn.ModuleList(
-            [AttentionHead(config) for _ in range(config.n_head)]
-        )
-        self.linear_head = nn.Linear(config.n_embd, config.n_embd)
-    
-    def forward(self, x: torch.Tensor):
-        h = torch.cat(
-            [head(x) for head in self.attention_heads],
-            dim=1
-        )
-        out = self.linear_head(h)
-        return out
+        out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
+        return out.transpose(-2, -1).contiguous().view(B, T, C)
 
 
 class Feedforward(nn.Module):
@@ -103,22 +95,25 @@ class Feedforward(nn.Module):
             nn.Linear(config.n_embd * config.ffw_inner_scale, config.n_embd)
         )
 
+    def forward(self, x: torch.Tensor):
+        return self.network(x)
+
 
 class TransformerBlock(nn.Module):
     
     def __init__(self, config: TinyGptConfig):
         super().__init__()
 
-        self.multi_attention_head = MultiAttentionHead(config)
-        self.feedforward_nwk = Feedforward(config)
+        self.c_attn = CasualSelfAttention(config)
+        self.mlp = Feedforward(config)
 
         # Layer norms
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
 
     def forward(self, x: torch.Tensor):
-        x = x + self.multi_attention_head(self.ln1(x))
-        x = x + self.feedforward_nwk(self.ln2(x))
+        x = x + self.c_attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
