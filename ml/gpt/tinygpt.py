@@ -54,8 +54,8 @@ class CasualSelfAttention(nn.Module):
         super().__init__()
         self.config = config
 
-        # Project n_embd to three vectors. We want the number of heads to be another
-        # batch dimension.
+        # Project n_embd to three vectors. We will split these and then make the number
+        # of attention heads a batch dimension.
         self.kqv = nn.Linear(config.n_embd, config.n_embd*3, bias=False)
         self.linear_head = nn.Linear(config.n_embd, config.n_embd)
 
