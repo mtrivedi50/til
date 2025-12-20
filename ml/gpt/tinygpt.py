@@ -6,7 +6,8 @@ import torch.nn.functional as F
 
 class TinyGptConfig(BaseModel):
     vocab_size: int = Field(
-        description="Total size of vocab."
+        description="Total size of vocab.",
+        default=27,
     )
     block_size: int = Field(
         description="Maximum context length for predictions.",
@@ -19,6 +20,7 @@ class TinyGptConfig(BaseModel):
     n_head: int = Field(
         description="Number of single-attention heads to concatenate to create the multi-attention head.",
         ge=2,
+        default=4,
     )
     n_layer: int = Field(
         description=" ".join([
@@ -26,6 +28,7 @@ class TinyGptConfig(BaseModel):
             "An individual layer is a masked multi-attention head followed by a feed-forward MLP."
         ]),
         ge=1,
+        default=4,
     )
     ffw_inner_scale: int = Field(
         description="Scale to apply to `n_embd` to compute the dimensionality of inner layer of feedforward network",
