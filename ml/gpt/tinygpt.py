@@ -121,26 +121,30 @@ class TinyGpt(nn.Module):
     def __init__(self, config: TinyGptConfig):
         super().__init__()
 
-        self.token_embeddings = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_embeddings = nn.Embedding(config.block_size, config.n_embd)
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.blocks = nn.Sequential(
             *[TransformerBlock(config) for _ in range(config.n_layer)]
         )
         self.ln = nn.LayerNorm(config.n_embd)
-        self.linear_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+
+        # Weight sharing. Note that lm_head.weight.shape = (vocab_size, n_embd), which
+        # matches exactly the shape of wte.weight.
+        self.lm_head.weight = self.wte.weight
 
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
         # x = (B, T)
         B, T = x.shape
 
         # Token + positional embeddings
-        token_emb = self.token_embeddings(x)  # (B, T, C)
-        pos_emb = self.pos_embeddings(torch.arange(T))  # (T, C)
+        token_emb = self.wte(x)  # (B, T, C)
+        pos_emb = self.wpe(torch.arange(T))  # (T, C)
         x = token_emb + pos_emb  # (B, T, C)
 
         # Compute logits
         x = self.blocks(x)  # (B, T, C)
-        logits = self.linear_head(self.ln(x))
+        logits = self.lm_head(self.ln(x))
 
         # Compute loss
         if y is not None:
@@ -158,8 +162,8 @@ class TinyGpt(nn.Module):
             # ...
             #
             # This is intentional; with attention, the last character in our sequence
-            # should have absorbed all the necessary context from previous characters.
-
+            # should have absorbed all the necessary context by "talking to" previous
+            # characters.
             logits = logits.view(B*T, C)
             y = y.view(B*T)
             loss = F.cross_entropy(logits, y)
