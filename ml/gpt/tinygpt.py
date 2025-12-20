@@ -58,8 +58,8 @@ class CasualSelfAttention(nn.Module):
         # of attention heads a batch dimension.
         self.kqv = nn.Linear(config.n_embd, config.n_embd*3, bias=False)
 
-        # Lower-triangular matrix for masking. Note viewing by 1,1,block_size,block_size
-        # works because we broadcast into the 1 dimensions.
+        # Lower-triangular matrix for masking. Note viewing by (1, 1, block_size,
+        # block_size) works because we broadcast into the 1 dimensions.
         self.register_buffer(
             "tril",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
