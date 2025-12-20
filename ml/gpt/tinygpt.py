@@ -132,6 +132,8 @@ class TinyGpt(nn.Module):
         # Weight sharing. Note that lm_head.weight.shape = (vocab_size, n_embd), which
         # matches exactly the shape of wte.weight.
         self.lm_head.weight = self.wte.weight
+        if self.lm_head.weight.data_ptr() != self.wte.weight.data_ptr():
+            raise Exception("Not properly sharing weights between input embedding layer and linear head!")
 
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
         # x = (B, T)
