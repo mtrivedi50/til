@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
 
 
 class TinyGptConfig(BaseModel):
@@ -61,6 +62,10 @@ class CasualSelfAttention(nn.Module):
         # of attention heads a batch dimension.
         self.kqv = nn.Linear(config.n_embd, config.n_embd*3, bias=False)
 
+        # Output projection, per multi-head attention definition in "Attention is all
+        # you need" paper.
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
         # Lower-triangular matrix for masking. Note viewing by (1, 1, block_size,
         # block_size) works because we broadcast into the 1 dimensions.
         self.register_buffer(
@@ -84,18 +89,17 @@ class CasualSelfAttention(nn.Module):
         # Softmax and output
         wei = F.softmax(wei, dim=-1)
         out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
-        return out.transpose(-2, -1).contiguous().view(B, T, C)
+        out = out.transpose(-2, -1).contiguous().view(B, T, C)
+        return self.c_proj(out)
 
 
-class Feedforward(nn.Module):
+class MLP(nn.Module):
 
     def __init__(self, config: TinyGptConfig):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd * config.ffw_inner_scale),
-            nn.ReLU(),
-            nn.Linear(config.n_embd * config.ffw_inner_scale, config.n_embd)
-        )
+        self.c_fc = nn.Linear(config.n_embd, config.n_embd * config.ffw_inner_scale)
+        self.relu = nn.ReLU()
+        self.c_proj = nn.Linear(config.n_embd * config.ffw_inner_scale, config.n_embd)
 
     def forward(self, x: torch.Tensor):
         return self.network(x)
@@ -107,13 +111,14 @@ class TransformerBlock(nn.Module):
         super().__init__()
 
         self.c_attn = CasualSelfAttention(config)
-        self.mlp = Feedforward(config)
+        self.mlp = MLP(config)
 
         # Layer norms
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
 
     def forward(self, x: torch.Tensor):
+        # Skip connections (aka residual connections).
         x = x + self.c_attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
@@ -137,6 +142,30 @@ class TinyGpt(nn.Module):
         self.lm_head.weight = self.wte.weight
         if self.lm_head.weight.data_ptr() != self.wte.weight.data_ptr():
             raise Exception("Not properly sharing weights between input embedding layer and linear head!")
+        
+        self.apply(self._init_weights)
+
+        # Scale weight of residual layers by a factor of 1/sqrt(n), where n is the
+        # number of residual layers. The transformer block has two residual connections,
+        # and there are n_layer transformer blocks in our architecture
+        # 
+        # Note the difference between residual connections and residual layers. Residual
+        # connections are the additive skip paths x + F(x); residual layers are
+        # implementation units that contain such connections.
+        for param_name, param in self.named_parameters():
+            if param_name.endswith("c_proj.weight"):
+                torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module: nn.Module):
+        """
+        GPT2 initialization
+        """
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
         # x = (B, T)
@@ -176,3 +205,8 @@ class TinyGpt(nn.Module):
             loss = None
     
         return logits, loss
+
+
+if __name__ == "__main__":
+    # Training loop...
+    pass
