@@ -146,12 +146,11 @@ class TinyGpt(nn.Module):
         self.apply(self._init_weights)
 
         # Scale weight of residual layers by a factor of 1/sqrt(n), where n is the
-        # number of residual layers. The transformer block has two residual connections,
-        # and there are n_layer transformer blocks in our architecture
-        # 
-        # Note the difference between residual connections and residual layers. Residual
-        # connections are the additive skip paths x + F(x); residual layers are
-        # implementation units that contain such connections.
+        # number of residual conections. The transformer block has two residual
+        # connections and there are n_layer transformer blocks in our architecture.
+
+        # GPT2 scales the weights of the linear layers that feed into the residual
+        # connections, so we do that here.
         for param_name, param in self.named_parameters():
             if param_name.endswith("c_proj.weight"):
                 torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
