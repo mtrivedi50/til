@@ -111,14 +111,14 @@ class CasualSelfAttention(nn.Module):
         # x = (B, T, C), where C = config.n_embd
         B, T, C = x.shape
         k, q, v = self.kqv(x).split(C, dim=-1)  # 3 tensors, each of B, T, C
-        k: torch.Tensor = k.view(B, T, self.config.n_head, self.config.head_size).transpose(-2, -1)  # B, nh, T, head_size
-        q: torch.Tensor = q.view(B, T, self.config.n_head, self.config.head_size).transpose(-2, -1)  # B, nh, T, head_size
-        v: torch.Tensor = v.view(B, T, self.config.n_head, self.config.head_size).transpose(-2, -1)  # B, nh, T, head_size
-        
+        k: torch.Tensor = k.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
+        q: torch.Tensor = q.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
+        v: torch.Tensor = v.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
+
         wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, nh, T, T
 
         # Prevent positions from attending to subsequent positions.
-        wei = wei.masked_fill(self.tril[:,:,T,T] == 0, float('-inf')) # B, nh, T, T
+        wei = wei.masked_fill(self.tril[:,:,:T,:T] == 0, float('-inf')) # B, nh, T, T
 
         # Softmax and output
         wei = F.softmax(wei, dim=-1)
