@@ -1,8 +1,25 @@
+import logging
+import math
+from pathlib import Path
 from pydantic import BaseModel, Field
 import torch
 from torch import nn
-import torch.nn.functional as F
-import math
+from torch.nn import functional as F
+from torch.optim.adamw import AdamW
+from torch.utils.data import DataLoader, RandomSampler
+
+from ml.gpt.utils import (
+    load_data,
+    define_alphabet,
+    build_dataset
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+WKDIR = Path(__file__).parent.parent.parent
+GPT = WKDIR / "ml" / "gpt"
 
 
 class TinyGptConfig(BaseModel):
@@ -34,6 +51,15 @@ class TinyGptConfig(BaseModel):
     ffw_inner_scale: int = Field(
         description="Scale to apply to `n_embd` to compute the dimensionality of inner layer of feedforward network",
         default=4,
+    )
+    # Training hyperparameters
+    batch_size: int = Field(
+        description="Batch size to use for training.",
+        default=32,
+    )
+    num_epochs: int = Field(
+        description="Number of epochs (complete passes through the dataset) to use for training.",
+        default=10,
     )
 
     @property
@@ -166,7 +192,31 @@ class TinyGpt(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
+    def configure_optimizers(self, lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
+        # Parameters that are more than 2-dimensional will be weight-decayed
+        params_grad: list[nn.Parameter] = [p for p in self.parameters() if p.requires_grad]
+        p_decay = []
+        p_no_decay = []
+        for p in params_grad:
+            if p.dim() >= 2:
+                p_decay.append(p)
+            else:
+                p_no_decay.append(p)
+        
+        param_groups = [
+            {
+                "weight_decay": weight_decay,
+                "params": p_decay,
+            },
+            {
+                "weight_decay": 0.0,
+                "params": p_no_decay,
+            },
+        ]
+        optim = torch.optim.AdamW(params=param_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
+        return optim
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         # x = (B, T)
         B, T = x.shape
 
@@ -207,5 +257,47 @@ class TinyGpt(nn.Module):
 
 
 if __name__ == "__main__":
-    # Training loop...
-    pass
+    text_data = load_data(WKDIR, GPT)
+    alphabet, chars_to_i = define_alphabet(text_data)
+    datasets = build_dataset(text_data, chars_to_i)
+
+    # Model
+    model_config = TinyGptConfig(vocab_size=len(alphabet))
+    model = TinyGpt(model_config)
+    optimizer = model.configure_optimizers()
+
+    # Training data
+    training_data_loader = DataLoader(
+        dataset=datasets["train"],
+        batch_size=model_config.batch_size,
+        shuffle=True,
+    )
+    val_x, val_y = datasets["val"][0]
+
+    # Training loop
+    running_loss = 0.0
+    training_loss = []
+    val_loss = []
+    for epoch_num in range(model_config.num_epochs):
+        epoch_loss = 0.0
+
+        model.train()
+        for i, x, y in enumerate(training_data_loader):
+            optimizer.zero_grad()
+
+            # Forward pass
+            logits, loss = model(x, y)
+
+            # Batch loss statistics
+            running_loss += loss.item()
+            if i > 0 and (i+1) % 100 == 0:
+                print(f"Batch {i+1-100}-{i} | Average Loss: {running_loss/100:.4f}")
+                epoch_loss += running_loss
+                running_loss = 0
+        
+        # Epoch loss
+        training_loss.append(epoch_loss / len(training_data_loader))
+
+        # Validation loss
+        val_logits, val_loss = model(val_x, val_y)
+        val_loss.append(val_loss.item())
