@@ -123,6 +123,12 @@ class CasualSelfAttention(nn.Module):
         # Softmax and output
         wei = F.softmax(wei, dim=-1)
         out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
+
+        # Confirm output shape
+        expected_shape = torch.Size([B, self.config.n_head, T, self.config.head_size])
+        if out.shape != expected_shape:
+            raise Exception(f"Unexpected shape of softmax weights @ values {out.shape}, expected: {expected_shape}.")
+
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(out)
 
