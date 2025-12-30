@@ -123,7 +123,7 @@ class CasualSelfAttention(nn.Module):
         # Softmax and output
         wei = F.softmax(wei, dim=-1)
         out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
-        out = out.transpose(-2, -1).contiguous().view(B, T, C)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(out)
 
 
@@ -321,7 +321,7 @@ if __name__ == "__main__":
                 grads = [param.grad.detach().flatten() for param in model.parameters()]
                 l2_norm = torch.cat(grads).norm(2)
                 gradient_norm = f"Gradient Norm: {(l2_norm ** 0.5):.4f}"
-                print(f"Batch {i+1-100}-{i} | {average_loss} | {gradient_norm}")
+                print(f"Batch {(i+1-100):03d}-{i:03d} | {average_loss} | {gradient_norm}")
 
                 epoch_loss += running_loss
                 running_loss = 0
