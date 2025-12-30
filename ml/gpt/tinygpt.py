@@ -53,6 +53,14 @@ class TinyGptConfig(BaseModel):
         default=4,
     )
     # Training hyperparameters
+    lr: float = Field(
+        description="Default learning rate",
+        default=1e-3
+    )
+    weight_decay: float = Field(
+        description="Weight decay for parameters that are >=2 dimensions (e.g., embeddings, params that participate in matrix multiplications, etc.)",
+        default=0.1,
+    )
     batch_size: int = Field(
         description="Batch size to use for training.",
         default=32,
@@ -128,7 +136,10 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(config.n_embd * config.ffw_inner_scale, config.n_embd)
 
     def forward(self, x: torch.Tensor):
-        return self.network(x)
+        x = self.c_fc(x)
+        x = self.relu(x)
+        x = self.c_proj(x)
+        return x
 
 
 class TransformerBlock(nn.Module):
@@ -193,7 +204,8 @@ class TinyGpt(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def configure_optimizers(self, lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
-        # Parameters that are more than 2-dimensional will be weight-decayed
+        # Parameters that are more than 2-dimensional will be weight-decayed. 1-D
+        # tensors (e.g., biases, layer norms) are not weight-decayed.
         params_grad: list[nn.Parameter] = [p for p in self.parameters() if p.requires_grad]
         p_decay = []
         p_no_decay = []
@@ -257,14 +269,21 @@ class TinyGpt(nn.Module):
 
 
 if __name__ == "__main__":
+    # Raw data
     text_data = load_data(WKDIR, GPT)
     alphabet, chars_to_i = define_alphabet(text_data)
-    datasets = build_dataset(text_data, chars_to_i)
+    
+    # Hyperparameters
+    model_config = TinyGptConfig(vocab_size=len(alphabet))
+    
+    # Datasets
+    datasets = build_dataset(text_data, chars_to_i, context_len=model_config.block_size)
 
     # Model
-    model_config = TinyGptConfig(vocab_size=len(alphabet))
     model = TinyGpt(model_config)
-    optimizer = model.configure_optimizers()
+    optimizer = model.configure_optimizers(model_config.lr, model_config.weight_decay)
+    total_params = sum([p.numel() for p in model.parameters()])
+    print(f"Number of parameters: {total_params}")
 
     # Training data
     training_data_loader = DataLoader(
@@ -282,18 +301,32 @@ if __name__ == "__main__":
         epoch_loss = 0.0
 
         model.train()
-        for i, x, y in enumerate(training_data_loader):
+        for i, (x, y) in enumerate(training_data_loader):
             optimizer.zero_grad()
 
             # Forward pass
             logits, loss = model(x, y)
 
+            # Backward pass
+            loss.backward()
+
             # Batch loss statistics
             running_loss += loss.item()
             if i > 0 and (i+1) % 100 == 0:
-                print(f"Batch {i+1-100}-{i} | Average Loss: {running_loss/100:.4f}")
+                # Average loss
+                average_loss = f"Average Loss: {running_loss/100:.4f}"
+
+                # Gradient norm
+                l2_norm = 0.0
+                grads = [param.grad.detach().flatten() for param in model.parameters()]
+                l2_norm = torch.cat(grads).norm(2)
+                gradient_norm = f"Gradient Norm: {(l2_norm ** 0.5):.4f}"
+                print(f"Batch {i+1-100}-{i} | {average_loss} | {gradient_norm}")
+
                 epoch_loss += running_loss
                 running_loss = 0
+            
+            optimizer.step()
         
         # Epoch loss
         training_loss.append(epoch_loss / len(training_data_loader))

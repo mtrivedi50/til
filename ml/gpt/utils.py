@@ -55,8 +55,10 @@ class CharacterLMDataset(Dataset):
         # x -> (1, context_len)
         # y -< (1, context_len)
         # In batch, these will be (B, context_len)
-        x = self.data[index:self.context_len]
-        y = self.data[index+1:self.context_len+1]
+        x_start, x_end = index, index + self.context_len
+        y_start, y_end = index + 1, index + 1 + self.context_len
+        x = self.data[x_start:x_end]
+        y = self.data[y_start:y_end]
         return x, y
 
 
