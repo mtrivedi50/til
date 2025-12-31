@@ -6,6 +6,9 @@ import subprocess
 from typing import Literal
 
 
+START_TOKEN = "<START>"
+
+
 def load_data(wkdir: Path, subdir: Path) -> str:
     """
     Load Shakespeare dataset from Karpathy's GitHub.
@@ -19,20 +22,25 @@ def load_data(wkdir: Path, subdir: Path) -> str:
 
     with open(subdir / "input.txt", "r", encoding="utf-8") as f:
         text = f.read()
+    
+    # Add the start token to the beginning
+    text = START_TOKEN + text
+
     return text
 
     
-def define_alphabet(text: str) -> tuple[list[str], dict[str, int]]:
+def define_alphabet(text: str) -> list[str]:
     """
     Process the input text. In particular, return:
         - A list of unique characters
         - A dictionary mapping characters to their associated index
     """
     unique_chars = sorted(list(set(text)))
-    chars_to_i = {
-        c: i for i, c in enumerate(unique_chars)
-    }
-    return unique_chars, chars_to_i
+
+    # Add a special "START" token
+    unique_chars = [START_TOKEN] + unique_chars
+
+    return unique_chars
 
 
 def encode(text: str, chars_to_i: str) -> list[int]:

@@ -1,7 +1,7 @@
 import logging
 import math
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader
 from ml.gpt.utils import (
     load_data,
     define_alphabet,
-    build_dataset
+    build_dataset,
+    START_TOKEN,
 )
 
 
@@ -22,9 +23,8 @@ GPT = WKDIR / "ml" / "gpt"
 
 
 class TinyGptConfig(BaseModel):
-    vocab_size: int = Field(
-        description="Total size of vocab.",
-        default=27,
+    token_set: list[str] = Field(
+        description="Set of all possible tokens in our corpus.",
     )
     block_size: int = Field(
         description="Maximum context length for predictions.",
@@ -69,6 +69,22 @@ class TinyGptConfig(BaseModel):
         default=10,
     )
 
+    _chars_to_index_map: dict[str, int] = PrivateAttr()
+    _index_to_chars_map: dict[int, str] = PrivateAttr()
+
+    @model_validator(mode="after")
+    def create_private_attrs(self) -> "TinyGptConfig":
+        self._chars_to_index_map = {}
+        self._index_to_chars_map = {}
+        for i, c in enumerate(self.token_set):
+            self._chars_to_index_map[c] = i
+            self._index_to_chars_map[i] = c
+        return self
+
+    @property
+    def num_tokens(self):
+        return len(self.token_set)
+
     @property
     def head_size(self):
         """
@@ -83,6 +99,12 @@ class TinyGptConfig(BaseModel):
         if self.n_embd % self.n_head != 0:
             raise Exception("`n_embd` must be divisible by `n_head`!")
         return head_size
+
+    def encode(self, char: str) -> int:
+        return self._chars_to_index_map[char]
+
+    def decode(self, idx: int) -> str:
+        return self._index_to_chars_map[idx] 
 
 
 class CasualSelfAttention(nn.Module):
@@ -170,16 +192,17 @@ class TinyGpt(nn.Module):
 
     def __init__(self, config: TinyGptConfig):
         super().__init__()
+        self.config = config
 
-        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wte = nn.Embedding(config.num_tokens, config.n_embd)
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.blocks = nn.Sequential(
             *[TransformerBlock(config) for _ in range(config.n_layer)]
         )
         self.ln = nn.LayerNorm(config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.lm_head = nn.Linear(config.n_embd, config.num_tokens)
 
-        # Weight sharing. Note that lm_head.weight.shape = (vocab_size, n_embd), which
+        # Weight sharing. Note that lm_head.weight.shape = (num_tokens, n_embd), which
         # matches exactly the shape of wte.weight.
         self.lm_head.weight = self.wte.weight
         if self.lm_head.weight.data_ptr() != self.wte.weight.data_ptr():
@@ -244,7 +267,7 @@ class TinyGpt(nn.Module):
 
         # Compute logits
         x = self.blocks(x)  # (B, T, C)
-        logits = self.lm_head(self.ln(x))
+        logits = self.lm_head(self.ln(x))  # (B, T, num_tokens)
 
         # Compute loss
         if y is not None:
@@ -271,23 +294,43 @@ class TinyGpt(nn.Module):
             loss = None
     
         return logits, loss
-    
-    def sample(self, index: int, max_tokens: int = 1000) -> str:
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_tokens: int = 1000, top_k: int | None = None) -> torch.Tensor:
         """
         Sample from the model to generate text.
         """
+        for _ in range(max_tokens):
+            # idx should be a 1-D tensor of indices
+            idx = idx if idx.shape[0] <= self.config.block_size else idx[-self.config.block_size:]
+
+            # reshape to be 2-D, since our model expects batches
+            idx = idx.view(1, idx.shape[0])
+
+            # Compute logits. Focus on logits of last character.
+            logits, _ = self(idx)  # (T, num_tokens)
+            logits = logits[-1, :]  # num_tokens
+            if top_k:
+                logits = torch.topk(logits, top_k).values
+
+            # Sample from probability distribution
+            probs = F.softmax(logits)
+            next_idx = torch.multinomial(probs, num_samples=1)[0].item()
+            print(self.config.decode(next_idx), end="")
+            idx = torch.cat([idx.flatten(), torch.tensor([next_idx])])
+        return idx
 
 
 if __name__ == "__main__":
     # Raw data
     text_data = load_data(WKDIR, GPT)
-    alphabet, chars_to_i = define_alphabet(text_data)
+    token_set = define_alphabet(text_data)
     
     # Hyperparameters
-    model_config = TinyGptConfig(vocab_size=len(alphabet))
+    model_config = TinyGptConfig(token_set=token_set)
     
     # Datasets
-    datasets = build_dataset(text_data, chars_to_i, context_len=model_config.block_size)
+    datasets = build_dataset(text_data, model_config._chars_to_index_map, context_len=model_config.block_size)
 
     # Model
     model = TinyGpt(model_config)
@@ -306,7 +349,7 @@ if __name__ == "__main__":
     # Training loop
     running_loss = 0.0
     training_loss = []
-    val_loss = []
+    validation_loss = []
     for epoch_num in range(model_config.num_epochs):
         epoch_loss = 0.0
 
@@ -342,5 +385,7 @@ if __name__ == "__main__":
         training_loss.append(epoch_loss / len(training_data_loader))
 
         # Validation loss
-        val_logits, val_loss = model(val_x, val_y)
-        val_loss.append(val_loss.item())
+        val_logits, val_loss = model(val_x.view(1,-1), val_y)
+        validation_loss.append(val_loss.item())
+
+    model.generate(torch.tensor([model_config.encode(START_TOKEN)]))
