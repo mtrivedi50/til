@@ -251,6 +251,10 @@ class TinyGpt(nn.Module):
         return optim
 
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Dimension can be 1 if computing validation loss or performing inference
+        if x.dim() == 1:
+            x = x.unsqueeze(0)  # (B, T), where B = 1
+
         # x = (B, T)
         B, T = x.shape
 
@@ -265,7 +269,7 @@ class TinyGpt(nn.Module):
 
         # Compute loss
         if y is not None:
-            B, T, C = logits.shape
+            B, T, num_tokens = logits.shape
 
             # Flatten the logits. Each row is the last character before the target.
             # e.g., if the sequence is "I am learning GPT", then the flatten operation
@@ -281,9 +285,7 @@ class TinyGpt(nn.Module):
             # This is intentional; with attention, the last character in our sequence
             # should have absorbed all the necessary context by "talking to" previous
             # characters.
-            logits = logits.view(B*T, C)
-            y = y.view(B*T)
-            loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits.view(B*T, num_tokens), y.view(B*T))
         else:
             loss = None
     
@@ -300,24 +302,27 @@ class TinyGpt(nn.Module):
         """
         Sample from the model to generate text.
         """
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)  # (1, T)
+
         for _ in range(max_tokens):
             # idx should be a 1-D tensor of indices
-            idx = idx if idx.shape[0] <= self.config.block_size else idx[-self.config.block_size:]
-
-            # reshape to be 2-D, since our model expects batches
-            idx = idx.view(1, idx.shape[0])
+            idx_cond = idx[:, -self.config.block_size:]  # (1, T)
 
             # Compute logits. Focus on logits of last character.
-            logits, _ = self(idx)  # (T, num_tokens)
-            logits = logits[-1, :]  # num_tokens
+            logits, _ = self(idx_cond)  # (1, T, num_tokens)
+            logits = logits[:, -1, :]  # (1, num_tokens)
             if top_k:
-                logits = torch.topk(logits, top_k).values
+                v, ix = torch.topk(logits, top_k).values  # (1,k) (1,k)
+                probs = F.softmax(v, dim=-1)  # (1,k)
+                k_choice = torch.multinomial(probs, num_samples=1)  # (1,1)
+                next_idx = ix.gather(-1, k_choice)
+            else:
+                probs = F.softmax(logits, dim=-1)
+                next_idx = torch.multinomial(probs, num_samples=1)  # (1,1)
 
-            # Sample from probability distribution
-            probs = F.softmax(logits)
-            next_idx = torch.multinomial(probs, num_samples=1)[0].item()
-            print(self.decode(next_idx), end="")
-            idx = torch.cat([idx.flatten(), torch.tensor([next_idx])])
+            print(self.decode(next_idx.item()), end="")
+            idx = torch.cat([idx, next_idx], dim=1)
         return idx
 
 
@@ -385,7 +390,8 @@ if __name__ == "__main__":
         training_loss.append(epoch_loss / len(training_data_loader))
 
         # Validation loss
-        val_logits, val_loss = model(val_x.view(1,-1), val_y)
+        model.eval()
+        val_logits, val_loss = model(val_x, val_y)
         validation_loss.append(val_loss.item())
 
     model.generate(torch.tensor([model.encode(START_TOKEN)]))
