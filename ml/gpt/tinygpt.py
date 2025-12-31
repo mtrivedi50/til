@@ -5,8 +5,7 @@ from pydantic import BaseModel, Field
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.optim.adamw import AdamW
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader
 
 from ml.gpt.utils import (
     load_data,
@@ -210,7 +209,7 @@ class TinyGpt(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def configure_optimizers(self, lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
-        # Parameters that are more than 2-dimensional will be weight-decayed. 1-D
+        # Parameters that are at least 2-dimensions will be weight-decayed. 1-D
         # tensors (e.g., biases, layer norms) are not weight-decayed.
         params_grad: list[nn.Parameter] = [p for p in self.parameters() if p.requires_grad]
         p_decay = []
@@ -272,6 +271,11 @@ class TinyGpt(nn.Module):
             loss = None
     
         return logits, loss
+    
+    def sample(self, index: int, max_tokens: int = 1000) -> str:
+        """
+        Sample from the model to generate text.
+        """
 
 
 if __name__ == "__main__":
