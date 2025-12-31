@@ -31,9 +31,7 @@ def load_data(wkdir: Path, subdir: Path) -> str:
     
 def define_alphabet(text: str) -> list[str]:
     """
-    Process the input text. In particular, return:
-        - A list of unique characters
-        - A dictionary mapping characters to their associated index
+    Return a list of unique characters, plus any special tokens
     """
     unique_chars = sorted(list(set(text)))
 
@@ -43,14 +41,10 @@ def define_alphabet(text: str) -> list[str]:
     return unique_chars
 
 
-def encode(text: str, chars_to_i: str) -> list[int]:
-    return [chars_to_i[c] for c in text]
-
-
 class CharacterLMDataset(Dataset):
 
     def __init__(self, data: torch.Tensor, context_len: int):
-        if len(data.shape) > 1 or data.dtype != torch.long:
+        if len(data.dim()) > 1 or data.dtype != torch.long:
             raise Exception(f"Data should be a tensor of integer indices. Got {data.dim()} dimensions with type {data.dtype}.")
         self.data = data
         self.context_len = context_len
@@ -60,8 +54,8 @@ class CharacterLMDataset(Dataset):
         return len(self.data) - self.context_len - 1
     
     def __getitem__(self, index: int):
-        # x -> (1, context_len)
-        # y -< (1, context_len)
+        # x -> 1-D tensor of dim (context_len)
+        # y -< 1-D tensor of dim (context_len)
         # In batch, these will be (B, context_len)
         x_start, x_end = index, index + self.context_len
         y_start, y_end = index + 1, index + 1 + self.context_len
@@ -77,7 +71,11 @@ def build_dataset(
     val_size: float = 0.1,
     context_len: int = 8,
 ) -> dict[Literal["train", "val", "test"], CharacterLMDataset]:
-    data = torch.tensor(encode(text, chars_to_i), dtype=torch.long)
+    
+    def _encode(text: str, chars_to_i: str) -> list[int]:
+        return [chars_to_i[c] for c in text]
+
+    data = torch.tensor(_encode(text, chars_to_i), dtype=torch.long)
 
     if train_size + val_size > 1:
         raise Exception("Training and validation sizes exceed 100%!")
