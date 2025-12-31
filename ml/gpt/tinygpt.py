@@ -2,12 +2,13 @@ import logging
 import math
 from pathlib import Path
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
+import time
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from ml.gpt.utils import (
+from utils import (
     load_data,
     define_alphabet,
     build_dataset,
@@ -18,8 +19,15 @@ from ml.gpt.utils import (
 logger = logging.getLogger(__name__)
 
 
-WKDIR = Path(__file__).parent.parent.parent
-GPT = WKDIR / "ml" / "gpt"
+# Constants
+WKDIR = Path(__file__).parent
+GPT = WKDIR
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
 
 
 class TinyGptConfig(BaseModel):
@@ -130,14 +138,14 @@ class CasualSelfAttention(nn.Module):
         q: torch.Tensor = q.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
         v: torch.Tensor = v.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
 
-        wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, nh, T, T
+        # Attention
+        # wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, nh, T, T
+        # wei = wei.masked_fill(self.tril[:,:,:T,:T] == 0, float('-inf')) # B, nh, T, T
+        # wei = F.softmax(wei, dim=-1)
+        # out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
 
-        # Prevent positions from attending to subsequent positions.
-        wei = wei.masked_fill(self.tril[:,:,:T,:T] == 0, float('-inf')) # B, nh, T, T
-
-        # Softmax and output
-        wei = F.softmax(wei, dim=-1)
-        out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
+        # Flash attention
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # Confirm output shape
         expected_shape = torch.Size([B, self.config.n_head, T, self.config.head_size])
@@ -260,7 +268,7 @@ class TinyGpt(nn.Module):
 
         # Token + positional embeddings
         token_emb = self.wte(x)  # (B, T, C)
-        pos_emb = self.wpe(torch.arange(T))  # (T, C)
+        pos_emb = self.wpe(torch.arange(T, device=DEVICE))  # (T, C)
         x = token_emb + pos_emb  # (B, T, C)
 
         # Compute logits
@@ -327,6 +335,11 @@ class TinyGpt(nn.Module):
 
 
 if __name__ == "__main__":
+    # Use TensorFloat32 datatype (1 sign bit, 8 exponent bits, 10 mantissa bits). This
+    # is lower precision that FP32 (23 mantissa bits), which results in faster training
+    # by less precision. In practice, the loss is precision is not noticeable.
+    torch.set_float32_matmul_precision('high')
+
     # Raw data
     text_data = load_data(WKDIR, GPT)
     token_set = define_alphabet(text_data)
@@ -339,9 +352,14 @@ if __name__ == "__main__":
 
     # Model
     model = TinyGpt(model_config)
-    optimizer = model.configure_optimizers(model_config.lr, model_config.weight_decay)
+    model.compile()
+    model.to(DEVICE)
+    
     total_params = sum([p.numel() for p in model.parameters()])
     print(f"Number of parameters: {total_params}")
+
+    # Optimizer
+    optimizer = model.configure_optimizers(model_config.lr, model_config.weight_decay)
 
     # Training data
     training_data_loader = DataLoader(
@@ -350,6 +368,7 @@ if __name__ == "__main__":
         shuffle=True,
     )
     val_x, val_y = datasets["val"][0]
+    val_x, val_y = val_x.to(DEVICE), val_y.to(DEVICE)
 
     # Training loop
     running_loss = 0.0
@@ -358,12 +377,17 @@ if __name__ == "__main__":
     for epoch_num in range(model_config.num_epochs):
         epoch_loss = 0.0
 
+        start_time = time.time()
+
         model.train()
         for i, (x, y) in enumerate(training_data_loader):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+
             optimizer.zero_grad()
 
             # Forward pass
-            logits, loss = model(x, y)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits, loss = model(x, y)
 
             # Backward pass
             loss.backward()
@@ -371,6 +395,21 @@ if __name__ == "__main__":
             # Batch loss statistics
             running_loss += loss.item()
             if i > 0 and (i+1) % 100 == 0:
+                # Number of tokens processed / second
+                end_time = time.time()
+                batch_elapsed = end_time - start_time
+                total_tokens = (
+                    100  # 100 batches
+                    * model_config.batch_size  # Each batch has `batch_size` examples
+                    * model_config.block_size  # Each example in batch has block_size tokens
+                )
+                total_tokens_per_sec = f"Tokens/sec: {(total_tokens / batch_elapsed):.4f}"
+                
+                # Total / average step time
+                total_step_time = f"Batch time: {(end_time - start_time)*1000:.4f}ms"
+                avg_step_time = f"Avg Step: {(end_time - start_time)*1000/100:.4f}ms"
+                start_time = time.time()
+
                 # Average loss
                 average_loss = f"Average Loss: {running_loss/100:.4f}"
 
@@ -379,7 +418,7 @@ if __name__ == "__main__":
                 grads = [param.grad.detach().flatten() for param in model.parameters()]
                 l2_norm = torch.cat(grads).norm(2)
                 gradient_norm = f"Gradient Norm: {(l2_norm ** 0.5):.4f}"
-                print(f"Batch {(i+1-100):03d}-{i:03d} | {average_loss} | {gradient_norm}")
+                print(f"Epoch {epoch_num+1:02d} | Batch {(i+1-100):04d}-{i:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
 
                 epoch_loss += running_loss
                 running_loss = 0
