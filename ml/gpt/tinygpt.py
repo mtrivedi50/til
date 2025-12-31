@@ -100,12 +100,6 @@ class TinyGptConfig(BaseModel):
             raise Exception("`n_embd` must be divisible by `n_head`!")
         return head_size
 
-    def encode(self, char: str) -> int:
-        return self._chars_to_index_map[char]
-
-    def decode(self, idx: int) -> str:
-        return self._index_to_chars_map[idx] 
-
 
 class CasualSelfAttention(nn.Module):
 
@@ -295,6 +289,12 @@ class TinyGpt(nn.Module):
     
         return logits, loss
 
+    def encode(self, char: str) -> int:
+        return self.config._chars_to_index_map[char]
+
+    def decode(self, idx: int) -> str:
+        return self.config._index_to_chars_map[idx] 
+
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_tokens: int = 1000, top_k: int | None = None) -> torch.Tensor:
         """
@@ -316,7 +316,7 @@ class TinyGpt(nn.Module):
             # Sample from probability distribution
             probs = F.softmax(logits)
             next_idx = torch.multinomial(probs, num_samples=1)[0].item()
-            print(self.config.decode(next_idx), end="")
+            print(self.decode(next_idx), end="")
             idx = torch.cat([idx.flatten(), torch.tensor([next_idx])])
         return idx
 
@@ -388,4 +388,4 @@ if __name__ == "__main__":
         val_logits, val_loss = model(val_x.view(1,-1), val_y)
         validation_loss.append(val_loss.item())
 
-    model.generate(torch.tensor([model_config.encode(START_TOKEN)]))
+    model.generate(torch.tensor([model.encode(START_TOKEN)]))
