@@ -44,7 +44,7 @@ def define_alphabet(text: str) -> list[str]:
 class CharacterLMDataset(Dataset):
 
     def __init__(self, data: torch.Tensor, context_len: int):
-        if len(data.dim()) > 1 or data.dtype != torch.long:
+        if data.dim() > 1 or data.dtype != torch.long:
             raise Exception(f"Data should be a tensor of integer indices. Got {data.dim()} dimensions with type {data.dtype}.")
         self.data = data
         self.context_len = context_len

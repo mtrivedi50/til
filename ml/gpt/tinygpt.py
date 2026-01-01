@@ -393,7 +393,8 @@ if __name__ == "__main__":
             loss.backward()
 
             # Batch loss statistics
-            running_loss += loss.item()
+            running_loss += loss.detach()
+            epoch_loss += loss.detach()
             if i > 0 and (i+1) % 100 == 0:
                 # Number of tokens processed / second
                 end_time = time.time()
@@ -411,16 +412,15 @@ if __name__ == "__main__":
                 start_time = time.time()
 
                 # Average loss
-                average_loss = f"Average Loss: {running_loss/100:.4f}"
+                average_loss = f"Average Loss: {(running_loss/100).item():.4f}"
 
                 # Gradient norm
                 l2_norm = 0.0
-                grads = [param.grad.detach().flatten() for param in model.parameters()]
+                grads = [param.grad.detach().flatten() for param in model.parameters() if param.grad is not None]
                 l2_norm = torch.cat(grads).norm(2)
-                gradient_norm = f"Gradient Norm: {(l2_norm ** 0.5):.4f}"
+                gradient_norm = f"Gradient Norm: {l2_norm:.4f}"
                 print(f"Epoch {epoch_num+1:02d} | Batch {(i+1-100):04d}-{i:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
 
-                epoch_loss += running_loss
                 running_loss = 0
             
             optimizer.step()
@@ -430,7 +430,9 @@ if __name__ == "__main__":
 
         # Validation loss
         model.eval()
-        val_logits, val_loss = model(val_x, val_y)
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                val_logits, val_loss = model(val_x, val_y)
         validation_loss.append(val_loss.item())
 
     model.generate(torch.tensor([model.encode(START_TOKEN)]))
