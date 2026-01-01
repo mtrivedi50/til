@@ -8,7 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from utils import (
+from ml.gpt.utils import (
     load_data,
     define_alphabet,
     build_dataset,
@@ -339,6 +339,7 @@ if __name__ == "__main__":
     # is lower precision that FP32 (23 mantissa bits), which results in faster training
     # by less precision. In practice, the loss is precision is not noticeable.
     torch.set_float32_matmul_precision('high')
+    torch.backends.fp32_precision = "tf32"  # allows TF32 for all applicable ops globally
 
     # Raw data
     text_data = load_data(WKDIR, GPT)
@@ -386,7 +387,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             # Forward pass
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
 
             # Backward pass
