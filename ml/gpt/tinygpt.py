@@ -60,9 +60,17 @@ class TinyGptConfig(BaseModel):
         default=4,
     )
     # Training hyperparameters
-    lr: float = Field(
-        description="Default learning rate",
-        default=1e-3
+    max_lr: float = Field(
+        description="Max learning rate",
+        default=3e-4
+    )
+    lr_warmup_steps: int = Field(
+        description="Number of steps used for learning rate's linear warmup.",
+        default=5e3
+    )
+    lr_max_steps: int = Field(
+        description="Max number of steps for scaling the learning rate (both warmup and cosine decay).",
+        default=5e4,
     )
     weight_decay: float = Field(
         description="Weight decay for parameters that are >=2 dimensions (e.g., embeddings, params that participate in matrix multiplications, etc.)",
@@ -75,6 +83,10 @@ class TinyGptConfig(BaseModel):
     num_epochs: int = Field(
         description="Number of epochs (complete passes through the dataset) to use for training.",
         default=10,
+    )
+    dropout: float = Field(
+        description="Percent of neurons to randomly turn off during training.",
+        default=0.1
     )
 
     _chars_to_index_map: dict[str, int] = PrivateAttr()
@@ -123,6 +135,9 @@ class CasualSelfAttention(nn.Module):
         # you need" paper.
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
+        # Dropout
+        self.dropout = nn.Dropout(p=config.dropout)
+
         # Lower-triangular matrix for masking. Note viewing by (1, 1, block_size,
         # block_size) works because we broadcast into the 1 dimensions.
         self.register_buffer(
@@ -153,7 +168,9 @@ class CasualSelfAttention(nn.Module):
             raise Exception(f"Unexpected shape of softmax weights @ values {out.shape}, expected: {expected_shape}.")
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(out)
+        out = self.c_proj(out)
+        out = self.dropout(out)
+        return out
 
 
 class MLP(nn.Module):
@@ -163,11 +180,13 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, config.n_embd * config.ffw_inner_scale)
         self.relu = nn.ReLU()
         self.c_proj = nn.Linear(config.n_embd * config.ffw_inner_scale, config.n_embd)
+        self.dropout = nn.Dropout(p=config.dropout)
 
     def forward(self, x: torch.Tensor):
         x = self.c_fc(x)
         x = self.relu(x)
         x = self.c_proj(x)
+        x = self.dropout(x)
         return x
 
 
@@ -233,7 +252,7 @@ class TinyGpt(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def configure_optimizers(self, lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
+    def configure_optimizers_with_initial_lr(self, lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
         # Parameters that are at least 2-dimensions will be weight-decayed. 1-D
         # tensors (e.g., biases, layer norms) are not weight-decayed.
         params_grad: list[nn.Parameter] = [p for p in self.parameters() if p.requires_grad]
@@ -257,6 +276,32 @@ class TinyGpt(nn.Module):
         ]
         optim = torch.optim.AdamW(params=param_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
         return optim
+
+    def get_lr(self, step: int) -> float:
+        """
+        Learning rate with:
+            1) Linear warmup
+            2) Cosine decay
+        """
+        min_lr = self.config.max_lr * 0.1
+        decay_steps = self.config.lr_max_steps - self.config.lr_warmup_steps
+
+        # Linear increase until we hit warmup steps
+        if step < self.config.lr_warmup_steps:
+            return self.config.max_lr * (step+1) / self.config.lr_warmup_steps
+
+        # If we have exceeded the max steps used for decay, use minimum LR
+        elif step > self.config.lr_max_steps:
+            return min_lr
+        
+        # Otherwise, cosine decay. T_cur = the current step number used in decay, T_max
+        # = total steps used for decay. Note that T_cur is different than `step`, since
+        # `step` also counts warmup steps.
+        # https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html
+        else:
+            coeff = 0.5 * (1.0 + math.cos(math.pi * (step - self.config.lr_warmup_steps) / decay_steps))
+            return min_lr + coeff * (self.config.max_lr - min_lr)
+            
 
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Dimension can be 1 if computing validation loss or performing inference
@@ -360,7 +405,7 @@ if __name__ == "__main__":
     print(f"Number of parameters: {total_params}")
 
     # Optimizer
-    optimizer = model.configure_optimizers(model_config.lr, model_config.weight_decay)
+    optimizer = model.configure_optimizers_with_initial_lr(model_config.max_lr, model_config.weight_decay)
 
     # Training data
     training_data_loader = DataLoader(
@@ -385,6 +430,11 @@ if __name__ == "__main__":
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             optimizer.zero_grad()
+
+            # LR
+            lr = model.get_lr(i)
+            for param_groups in optimizer.param_groups:
+                param_groups["lr"] = lr
 
             # Forward pass
             with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
