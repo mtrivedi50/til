@@ -78,7 +78,15 @@ class TinyGptConfig(BaseModel):
     )
     batch_size: int = Field(
         description="Batch size to use for training.",
-        default=32,
+        default=32
+    )
+    accumulate_gradients: bool = Field(
+        descrption="Whether to accumulate gradients over micro-batches",
+        default=False,
+    )
+    micro_batch_size: int = Field(
+        description="Micro batch size to use for training. Gradients are accumulated every `accumulation_steps` steps.",
+        default=4,
     )
     num_epochs: int = Field(
         description="Number of epochs (complete passes through the dataset) to use for training.",
@@ -100,6 +108,12 @@ class TinyGptConfig(BaseModel):
             self._chars_to_index_map[c] = i
             self._index_to_chars_map[i] = c
         return self
+    
+    @model_validator(mode="after")
+    def validate_micro_batch(self) -> "TinyGptConfig":
+        if self.accumulate_gradients and self.batch_size % self.micro_batch_size > 0:
+            raise Exception("`batch_size` must be divisible by `micro_batch_size`.")
+        return self
 
     @property
     def num_tokens(self):
@@ -119,6 +133,12 @@ class TinyGptConfig(BaseModel):
         if self.n_embd % self.n_head != 0:
             raise Exception("`n_embd` must be divisible by `n_head`!")
         return head_size
+    
+    @property
+    def accumulation_steps(self) -> int:
+        if not self.accumulate_gradients:
+            return 1
+        return int(self.batch_size / self.micro_batch_size)
 
 
 class CasualSelfAttention(nn.Module):
@@ -391,7 +411,12 @@ if __name__ == "__main__":
     token_set = define_alphabet(text_data)
     
     # Hyperparameters
-    model_config = TinyGptConfig(token_set=token_set)
+    model_config = TinyGptConfig(
+        token_set=token_set,
+        accumulate_gradients=True,
+        batch_size=32,
+        micro_batch_size=8
+    )
     
     # Datasets
     datasets = build_dataset(text_data, model_config._chars_to_index_map, context_len=model_config.block_size)
@@ -410,7 +435,11 @@ if __name__ == "__main__":
     # Training data
     training_data_loader = DataLoader(
         dataset=datasets["train"],
-        batch_size=model_config.batch_size,
+        batch_size=(
+            model_config.micro_batch_size
+            if model_config.accumulate_gradients
+            else model_config.batch_size
+        ),
         shuffle=True,
     )
     val_x, val_y = datasets["val"][0]
@@ -431,21 +460,32 @@ if __name__ == "__main__":
 
             optimizer.zero_grad()
 
+            # Accumulate gradients. Note that if we are not accumulating gradients, then
+            # accumulation_steps will just be 1.
+            loss_accum = 0.0
+            for _ in range(model_config.accumulation_steps):
+                # Forward pass
+                with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+
+                # Make sure to compute average loss.
+                loss = loss / model_config.accumulation_steps
+                loss_accum += loss
+
+                # Backward pass
+                loss.backward()
+
             # LR
             lr = model.get_lr(i)
             for param_groups in optimizer.param_groups:
                 param_groups["lr"] = lr
-
-            # Forward pass
-            with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
-
-            # Backward pass
-            loss.backward()
+            
+            # Clip gradients
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
             # Batch loss statistics
-            running_loss += loss.detach()
-            epoch_loss += loss.detach()
+            running_loss += loss_accum.detach()
+            epoch_loss += loss_accum.detach()
             if i > 0 and (i+1) % 100 == 0:
                 # Number of tokens processed / second
                 end_time = time.time()
@@ -466,10 +506,7 @@ if __name__ == "__main__":
                 average_loss = f"Average Loss: {(running_loss/100).item():.4f}"
 
                 # Gradient norm
-                l2_norm = 0.0
-                grads = [param.grad.detach().flatten() for param in model.parameters() if param.grad is not None]
-                l2_norm = torch.cat(grads).norm(2)
-                gradient_norm = f"Gradient Norm: {l2_norm:.4f}"
+                gradient_norm = f"Gradient Norm: {norm:.4f}"
                 print(f"Epoch {epoch_num+1:02d} | Batch {(i+1-100):04d}-{i:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
 
                 running_loss = 0
