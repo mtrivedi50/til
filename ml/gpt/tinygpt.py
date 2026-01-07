@@ -1,8 +1,9 @@
+from functools import cached_property
 import logging
 import math
 import os
 from pathlib import Path
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, computed_field
 import time
 import torch
 import torch.distributed as dist
@@ -30,16 +31,16 @@ WKDIR = Path(__file__).parent
 GPT = WKDIR
 
 
-def define_device(local_rank: int | None = None) -> str:
+def define_device(local_rank: int | None = None) -> torch.device:
     if torch.cuda.is_available():
         if local_rank is not None:
-            return f"cuda:{local_rank}"
+            return torch.device(f"cuda:{local_rank}")
         else:
-            return "cuda"
+            return torch.device("cuda")
     elif torch.mps.is_available():
-        return "mps"
+        return torch.device("mps")
     else:
-        return "cpu"
+        return torch.device("cpu")
 
 
 def setup_ddp() -> tuple[int, int, int]:
@@ -65,10 +66,33 @@ def cleanup() -> None:
     destroy_process_group()
 
 
-class TinyGptConfig(BaseModel):
-    token_set: list[str] = Field(
+class DataConfig(BaseModel):
+    tokens: list[str] = Field(
         description="Set of all possible tokens in our corpus.",
     )
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.tokens)
+    
+    @computed_field
+    @cached_property
+    def itos(self) -> dict[int, str]:
+        """Index-to-token (itos)."""
+        return {
+            i: s for i, s in enumerate(self.tokens)
+        }
+
+    @computed_field
+    @cached_property
+    def stoi(self) -> dict[str, int]:
+        """Token-to-index (stoi)"""
+        return {
+            s: i for i, s in enumerate(self.tokens)
+        }
+
+
+class ModelConfig(BaseModel):
     block_size: int = Field(
         description="Maximum context length for predictions.",
         default=256
@@ -90,11 +114,29 @@ class TinyGptConfig(BaseModel):
         ge=1,
         default=4,
     )
-    ffw_inner_scale: int = Field(
-        description="Scale to apply to `n_embd` to compute the dimensionality of inner layer of feedforward network",
+    mlp_inner_scale: int = Field(
+        description="Scale to apply to `n_embd` for dimensionality of inner layer of feedforward network",
         default=4,
     )
-    # Training hyperparameters
+
+    @computed_field
+    @cached_property
+    def head_size(self):
+        """
+        Size of the attention head. This controls the size of the embedding space used
+        for keys, queries, and values.
+
+        During attention, we project our input tensors to a dimension of this size. For
+        multi-attention, we concatenate all of the single-attention heads together,
+        which means the final output is equal to `n_embd`.
+        """
+        head_size = self.n_embd // self.n_head
+        if self.n_embd % self.n_head != 0:
+            raise Exception("`n_embd` must be divisible by `n_head`!")
+        return head_size
+
+
+class TrainConfig(BaseModel):
     max_lr: float = Field(
         description="Max learning rate",
         default=3e-4
@@ -112,12 +154,8 @@ class TinyGptConfig(BaseModel):
         default=0.1,
     )
     batch_size: int = Field(
-        description="Batch size to use for training.",
+        description="Full batch size to use for training.",
         default=1024
-    )
-    accumulate_gradients: bool = Field(
-        descrption="Whether to accumulate gradients over micro-batches",
-        default=False,
     )
     micro_batch_size: int = Field(
         description="Micro batch size to use for training, used for gradient accumulation.",
@@ -132,44 +170,18 @@ class TinyGptConfig(BaseModel):
         default=0.1
     )
 
-    _chars_to_index_map: dict[str, int] = PrivateAttr()
-    _index_to_chars_map: dict[int, str] = PrivateAttr()
-
-    @model_validator(mode="after")
-    def create_private_attrs(self) -> "TinyGptConfig":
-        self._chars_to_index_map = {}
-        self._index_to_chars_map = {}
-        for i, c in enumerate(self.token_set):
-            self._chars_to_index_map[c] = i
-            self._index_to_chars_map[i] = c
-        return self
-
-    @property
-    def num_tokens(self):
-        return len(self.token_set)
-
-    @property
-    def head_size(self):
-        """
-        Size of the attention head. This controls the size of the embedding space used
-        for keys, queries, and values.
-
-        During attention, we project our input tensors to a dimension of this size. For
-        multi-attention, we concatenate all of the single-attention heads together,
-        which means the final output is equal to `n_embd`.
-        """
-        head_size = self.n_embd // self.n_head
-        if self.n_embd % self.n_head != 0:
-            raise Exception("`n_embd` must be divisible by `n_head`!")
-        return head_size
-    
     def get_accumulation_steps(self, world_size: int) -> int:
-        if self.accumulate_gradients and self.batch_size % (self.micro_batch_size * world_size) > 0:
+        if self.batch_size % (self.micro_batch_size * world_size) > 0:
             raise Exception(f"`batch_size` must be divisible by (micro_batch_size * world_size). Got {self.batch_size % (self.micro_batch_size * world_size):.4f}.")
 
-        if not self.accumulate_gradients:
-            return 1
         return int(self.batch_size / (self.micro_batch_size * world_size))
+
+
+class TinyGptConfig(BaseModel):
+    data: DataConfig
+    model: ModelConfig
+    train: TrainConfig
+    
 
 
 class CasualSelfAttention(nn.Module):
@@ -180,24 +192,24 @@ class CasualSelfAttention(nn.Module):
 
         # Project n_embd to three vectors. We will split these and then make the number
         # of attention heads a batch dimension.
-        self.kqv = nn.Linear(config.n_embd, config.n_embd*3, bias=False)
+        self.kqv = nn.Linear(config.model.n_embd, config.model.n_embd*3, bias=False)
 
         # Output projection, per multi-head attention definition in "Attention is all
         # you need" paper.
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.model.n_embd, config.model.n_embd)
 
         # Dropout
-        self.dropout = nn.Dropout(p=config.dropout)
+        self.dropout = nn.Dropout(p=config.train.dropout)
 
         # Lower-triangular matrix for masking. Note viewing by (1, 1, block_size,
         # block_size) works because we broadcast into the 1 dimensions.
         self.register_buffer(
             "tril",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+            torch.tril(torch.ones(config.model.block_size, config.model.block_size)).view(1, 1, config.model.block_size, config.model.block_size)
         )
 
     def forward(self, x: torch.Tensor):
-        # x = (B, T, C), where C = config.n_embd
+        # x = (B, T, C), where C = config.model.n_embd
         B, T, C = x.shape
         k, q, v = self.kqv(x).split(C, dim=-1)  # 3 tensors, each of B, T, C
         k: torch.Tensor = k.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
@@ -228,10 +240,10 @@ class MLP(nn.Module):
 
     def __init__(self, config: TinyGptConfig):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, config.n_embd * config.ffw_inner_scale)
+        self.c_fc = nn.Linear(config.model.n_embd, config.model.n_embd * config.model.mlp_inner_scale)
         self.relu = nn.ReLU()
-        self.c_proj = nn.Linear(config.n_embd * config.ffw_inner_scale, config.n_embd)
-        self.dropout = nn.Dropout(p=config.dropout)
+        self.c_proj = nn.Linear(config.model.n_embd * config.model.mlp_inner_scale, config.model.n_embd)
+        self.dropout = nn.Dropout(p=config.train.dropout)
 
     def forward(self, x: torch.Tensor):
         x = self.c_fc(x)
@@ -250,8 +262,8 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config)
 
         # Layer norms
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.ln1 = nn.LayerNorm(config.model.n_embd)
+        self.ln2 = nn.LayerNorm(config.model.n_embd)
 
     def forward(self, x: torch.Tensor):
         # Skip connections (aka residual connections).
@@ -262,18 +274,18 @@ class TransformerBlock(nn.Module):
 
 class TinyGpt(nn.Module):
 
-    def __init__(self, config: TinyGptConfig, device: str):
+    def __init__(self, config: TinyGptConfig, device: torch.device):
         super().__init__()
         self.config = config
         self.device = device
 
-        self.wte = nn.Embedding(config.num_tokens, config.n_embd)
-        self.wpe = nn.Embedding(config.block_size, config.n_embd)
+        self.wte = nn.Embedding(config.data.vocab_size, config.model.n_embd)
+        self.wpe = nn.Embedding(config.model.block_size, config.model.n_embd)
         self.blocks = nn.Sequential(
-            *[TransformerBlock(config) for _ in range(config.n_layer)]
+            *[TransformerBlock(config) for _ in range(config.model.n_layer)]
         )
-        self.ln = nn.LayerNorm(config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.num_tokens)
+        self.ln = nn.LayerNorm(config.model.n_embd)
+        self.lm_head = nn.Linear(config.model.n_embd, config.data.vocab_size)
 
         # Weight sharing. Note that lm_head.weight.shape = (num_tokens, n_embd), which
         # matches exactly the shape of wte.weight.
@@ -291,7 +303,7 @@ class TinyGpt(nn.Module):
         # connections, so we do that here.
         for param_name, param in self.named_parameters():
             if param_name.endswith("c_proj.weight"):
-                torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * config.model.n_layer))
 
     def _init_weights(self, module: nn.Module):
         """
@@ -346,10 +358,10 @@ class TinyGpt(nn.Module):
         return logits, loss
 
     def encode(self, char: str) -> int:
-        return self.config._chars_to_index_map[char]
+        return self.config.data.stoi[char]
 
     def decode(self, idx: int) -> str:
-        return self.config._index_to_chars_map[idx] 
+        return self.config.data.itos[idx] 
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_tokens: int = 1000, top_k: int | None = None) -> torch.Tensor:
@@ -361,7 +373,7 @@ class TinyGpt(nn.Module):
 
         for _ in range(max_tokens):
             # idx should be a 1-D tensor of indices
-            idx_cond = idx[:, -self.config.block_size:]  # (1, T)
+            idx_cond = idx[:, -self.config.model.block_size:]  # (1, T)
 
             # Compute logits. Focus on logits of last character.
             logits, _ = self(idx_cond)  # (1, T, num_tokens)
@@ -412,15 +424,15 @@ def get_lr(step: int, config: TinyGptConfig) -> float:
         1) Linear warmup
         2) Cosine decay
     """
-    min_lr = config.max_lr * 0.1
-    decay_steps = config.lr_max_steps - config.lr_warmup_steps
+    min_lr = config.train.max_lr * 0.1
+    decay_steps = config.train.lr_max_steps - config.train.lr_warmup_steps
 
     # Linear increase until we hit warmup steps
-    if step < config.lr_warmup_steps:
-        return config.max_lr * (step+1) / config.lr_warmup_steps
+    if step < config.train.lr_warmup_steps:
+        return config.train.max_lr * (step+1) / config.train.lr_warmup_steps
 
     # If we have exceeded the max steps used for decay, use minimum LR
-    elif step > config.lr_max_steps:
+    elif step > config.train.lr_max_steps:
         return min_lr
     
     # Otherwise, cosine decay. T_cur = the current step number used in decay, T_max
@@ -428,8 +440,8 @@ def get_lr(step: int, config: TinyGptConfig) -> float:
     # `step` also counts warmup steps.
     # https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html
     else:
-        coeff = 0.5 * (1.0 + math.cos(math.pi * (step - config.lr_warmup_steps) / decay_steps))
-        return min_lr + coeff * (config.max_lr - min_lr)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * (step - config.train.lr_warmup_steps) / decay_steps))
+        return min_lr + coeff * (config.train.max_lr - min_lr)
 
 
 if __name__ == "__main__":
@@ -447,19 +459,20 @@ if __name__ == "__main__":
     token_set = define_alphabet(text_data)
     
     # Hyperparameters
-    model_config = TinyGptConfig(
-        token_set=token_set,
-        accumulate_gradients=True,
-        batch_size=32,
-        micro_batch_size=8
+    cfg = TinyGptConfig(
+        data=DataConfig(tokens=token_set),
+        train=TrainConfig(
+            batch_size=32,
+            micro_batch_size=8
+        )
     )
     
     # Datasets
-    datasets = build_dataset(text_data, model_config._chars_to_index_map, context_len=model_config.block_size)
+    datasets = build_dataset(text_data, cfg.data.stoi, context_len=cfg.model.block_size)
 
     # Model
     device = define_device(local_rank)
-    model = TinyGpt(model_config, device=device).to(device)
+    model = TinyGpt(cfg, device=device).to(device)
     model = torch.compile(model)
     ddp_model = DDP(model, device_ids=[local_rank])
     
@@ -470,8 +483,8 @@ if __name__ == "__main__":
     # Optimizer
     optimizer = configure_optimizers_with_initial_lr(
         ddp_model.parameters(),
-        model_config.max_lr,
-        model_config.weight_decay
+        cfg.train.max_lr,
+        cfg.train.weight_decay
     )
 
     # Training data
@@ -483,11 +496,7 @@ if __name__ == "__main__":
     )
     training_data_loader = DataLoader(
         dataset=datasets["train"],
-        batch_size=(
-            model_config.micro_batch_size
-            if model_config.accumulate_gradients
-            else model_config.batch_size
-        ),
+        batch_size=cfg.micro_batch_size,
         sampler=sampler,
         shuffle=False,
         drop_last=True,
@@ -499,7 +508,7 @@ if __name__ == "__main__":
     running_loss = 0.0
     training_loss = []
     validation_loss = []
-    for epoch_num in range(model_config.num_epochs):
+    for epoch_num in range(cfg.train.num_epochs):
         # Epoch-level sampling
         sampler.set_epoch(epoch_num)
 
@@ -510,7 +519,7 @@ if __name__ == "__main__":
 
         # Accumulate gradients. Note that if we are not accumulating gradients, then
         # accumulation_steps will just be 1.
-        accum_steps = model_config.get_accumulation_steps(world_size)
+        accum_steps = cfg.train.get_accumulation_steps(world_size)
 
         start_time = time.time()
 
@@ -522,7 +531,7 @@ if __name__ == "__main__":
             x, y = x.to(device), y.to(device)
 
             # Forward pass
-            with torch.autocast(device_type="cuda" if "cuda" in device else device, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 logits, loss = ddp_model(x, y)
 
             # Our data loader loads micro-batches. We want to make sure our loss
@@ -549,7 +558,7 @@ if __name__ == "__main__":
             # LR
             # TODO - LR should scale based on number of tokens, not number of steps.
             global_step = epoch_num * len(training_data_loader) + step
-            lr = get_lr(global_step, model_config)
+            lr = get_lr(global_step, cfg)
             for param_groups in optimizer.param_groups:
                 param_groups["lr"] = lr
 
@@ -571,15 +580,17 @@ if __name__ == "__main__":
             # micro-batch.
             loss_accum = 0.0
 
-            # Every 100 micro-batches on the master process, log some statistics
-            if is_master_process and step > 0 and (step+1) % 100 == 0:
+            # Every 100 optimization steps (i.e., every 100 * accum_steps micro-batches)
+            # on the master process, log some statistics
+            optim_step = (step+1) // accum_steps
+            if is_master_process and optim_step > 0 and optim_step % 100 == 0:
                 # Number of tokens processed / second
                 end_time = time.time()
                 batch_elapsed = end_time - start_time
                 total_tokens = (
                     100  # 100 batches
-                    * model_config.micro_batch_size  # Each batch has `micro_batch_size` examples
-                    * model_config.block_size  # Each example in batch has block_size tokens
+                    * cfg.micro_batch_size  # Each batch has `micro_batch_size` examples
+                    * cfg.model.block_size  # Each example in batch has block_size tokens
                     * world_size
                 )
                 total_tokens_per_sec = f"Tokens/sec: {(total_tokens / batch_elapsed):.4f}"
@@ -599,16 +610,18 @@ if __name__ == "__main__":
 
                 running_loss = 0
         
-        # epoch_loss is the sum of average loss across all ranks for each batch in our
-        # dataset. Take average by dividing it by the number of batches.
-        num_opt_steps = len(training_data_loader) // accum_steps
-        training_loss.append(epoch_loss / num_opt_steps)
+        # epoch_loss is the sum of average accumulated loss across all ranks for each
+        # batch in our dataset. Divide by number of optimization steps (roughly equal to
+        # number of batches, after correction for "last batch" weirdness).
+        num_optim_steps = len(training_data_loader) // accum_steps
+        training_loss.append(epoch_loss / num_optim_steps)
 
-        # Validation loss
+        # Validation loss. Our model weights have been synchronized across all ranks, so
+        # only run validation test on the master process.
         if is_master_process:
             ddp_model.eval()
             with torch.no_grad():
-                with torch.autocast(device_type="cuda" if "cuda" in device else device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     val_logits, val_loss = ddp_model(val_x, val_y)
             validation_loss.append(val_loss.item())
 
