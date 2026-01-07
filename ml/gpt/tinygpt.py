@@ -1,12 +1,18 @@
 import logging
 import math
+import os
 from pathlib import Path
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 import time
 import torch
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parameter import Parameter
+from torch.utils.data import DataLoader, DistributedSampler
+from typing import Iterator
 
 from ml.gpt.utils import (
     load_data,
@@ -22,12 +28,41 @@ logger = logging.getLogger(__name__)
 # Constants
 WKDIR = Path(__file__).parent
 GPT = WKDIR
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-elif torch.mps.is_available():
-    DEVICE = "mps"
-else:
-    DEVICE = "cpu"
+
+
+def define_device(local_rank: int | None = None) -> str:
+    if torch.cuda.is_available():
+        if local_rank is not None:
+            return f"cuda:{local_rank}"
+        else:
+            return "cuda"
+    elif torch.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
+def setup_ddp() -> tuple[int, int, int]:
+    if not torch.cuda.is_available():
+        raise Exception("DDP can only run on CUDA!")
+
+    # Initialize the process group using NCCL backend. Can potentially use the code
+    # below to automatically select backend?
+    #     acc = torch.accelerator.current_accelerator()
+    #     backend = torch.distributed.get_default_backend_for_device(acc)
+    init_process_group(backend="nccl")
+    
+    # Rank and world size are automatically calculated via `torchrun` and injected via
+    # environment variables.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    return local_rank, global_rank, world_size
+
+
+def cleanup() -> None:
+    destroy_process_group()
 
 
 class TinyGptConfig(BaseModel):
@@ -78,15 +113,15 @@ class TinyGptConfig(BaseModel):
     )
     batch_size: int = Field(
         description="Batch size to use for training.",
-        default=32
+        default=1024
     )
     accumulate_gradients: bool = Field(
         descrption="Whether to accumulate gradients over micro-batches",
         default=False,
     )
     micro_batch_size: int = Field(
-        description="Micro batch size to use for training. Gradients are accumulated every `accumulation_steps` steps.",
-        default=4,
+        description="Micro batch size to use for training, used for gradient accumulation.",
+        default=32,
     )
     num_epochs: int = Field(
         description="Number of epochs (complete passes through the dataset) to use for training.",
@@ -108,12 +143,6 @@ class TinyGptConfig(BaseModel):
             self._chars_to_index_map[c] = i
             self._index_to_chars_map[i] = c
         return self
-    
-    @model_validator(mode="after")
-    def validate_micro_batch(self) -> "TinyGptConfig":
-        if self.accumulate_gradients and self.batch_size % self.micro_batch_size > 0:
-            raise Exception("`batch_size` must be divisible by `micro_batch_size`.")
-        return self
 
     @property
     def num_tokens(self):
@@ -134,11 +163,13 @@ class TinyGptConfig(BaseModel):
             raise Exception("`n_embd` must be divisible by `n_head`!")
         return head_size
     
-    @property
-    def accumulation_steps(self) -> int:
+    def get_accumulation_steps(self, world_size: int) -> int:
+        if self.accumulate_gradients and self.batch_size % (self.micro_batch_size * world_size) > 0:
+            raise Exception(f"`batch_size` must be divisible by (micro_batch_size * world_size). Got {self.batch_size % (self.micro_batch_size * world_size):.4f}.")
+
         if not self.accumulate_gradients:
             return 1
-        return int(self.batch_size / self.micro_batch_size)
+        return int(self.batch_size / (self.micro_batch_size * world_size))
 
 
 class CasualSelfAttention(nn.Module):
@@ -231,9 +262,10 @@ class TransformerBlock(nn.Module):
 
 class TinyGpt(nn.Module):
 
-    def __init__(self, config: TinyGptConfig):
+    def __init__(self, config: TinyGptConfig, device: str):
         super().__init__()
         self.config = config
+        self.device = device
 
         self.wte = nn.Embedding(config.num_tokens, config.n_embd)
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
@@ -271,58 +303,7 @@ class TinyGpt(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def configure_optimizers_with_initial_lr(self, lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
-        # Parameters that are at least 2-dimensions will be weight-decayed. 1-D
-        # tensors (e.g., biases, layer norms) are not weight-decayed.
-        params_grad: list[nn.Parameter] = [p for p in self.parameters() if p.requires_grad]
-        p_decay = []
-        p_no_decay = []
-        for p in params_grad:
-            if p.dim() >= 2:
-                p_decay.append(p)
-            else:
-                p_no_decay.append(p)
-        
-        param_groups = [
-            {
-                "weight_decay": weight_decay,
-                "params": p_decay,
-            },
-            {
-                "weight_decay": 0.0,
-                "params": p_no_decay,
-            },
-        ]
-        optim = torch.optim.AdamW(params=param_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
-        return optim
-
-    def get_lr(self, step: int) -> float:
-        """
-        Learning rate with:
-            1) Linear warmup
-            2) Cosine decay
-        """
-        min_lr = self.config.max_lr * 0.1
-        decay_steps = self.config.lr_max_steps - self.config.lr_warmup_steps
-
-        # Linear increase until we hit warmup steps
-        if step < self.config.lr_warmup_steps:
-            return self.config.max_lr * (step+1) / self.config.lr_warmup_steps
-
-        # If we have exceeded the max steps used for decay, use minimum LR
-        elif step > self.config.lr_max_steps:
-            return min_lr
-        
-        # Otherwise, cosine decay. T_cur = the current step number used in decay, T_max
-        # = total steps used for decay. Note that T_cur is different than `step`, since
-        # `step` also counts warmup steps.
-        # https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html
-        else:
-            coeff = 0.5 * (1.0 + math.cos(math.pi * (step - self.config.lr_warmup_steps) / decay_steps))
-            return min_lr + coeff * (self.config.max_lr - min_lr)
-            
-
+    
     def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Dimension can be 1 if computing validation loss or performing inference
         if x.dim() == 1:
@@ -333,7 +314,7 @@ class TinyGpt(nn.Module):
 
         # Token + positional embeddings
         token_emb = self.wte(x)  # (B, T, C)
-        pos_emb = self.wpe(torch.arange(T, device=DEVICE))  # (T, C)
+        pos_emb = self.wpe(torch.arange(T, device=self.device))  # (T, C)
         x = token_emb + pos_emb  # (B, T, C)
 
         # Compute logits
@@ -399,7 +380,63 @@ class TinyGpt(nn.Module):
         return idx
 
 
+def configure_optimizers_with_initial_lr(parameters: Iterator[Parameter], lr: float | torch.Tensor, weight_decay: float,) -> torch.optim.AdamW:
+    # Parameters that are at least 2-dimensions will be weight-decayed. 1-D
+    # tensors (e.g., biases, layer norms) are not weight-decayed.
+    params_grad: list[nn.Parameter] = [p for p in parameters if p.requires_grad]
+    p_decay = []
+    p_no_decay = []
+    for p in params_grad:
+        if p.dim() >= 2:
+            p_decay.append(p)
+        else:
+            p_no_decay.append(p)
+    
+    param_groups = [
+        {
+            "weight_decay": weight_decay,
+            "params": p_decay,
+        },
+        {
+            "weight_decay": 0.0,
+            "params": p_no_decay,
+        },
+    ]
+    optim = torch.optim.AdamW(params=param_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
+    return optim
+
+
+def get_lr(step: int, config: TinyGptConfig) -> float:
+    """
+    Learning rate with:
+        1) Linear warmup
+        2) Cosine decay
+    """
+    min_lr = config.max_lr * 0.1
+    decay_steps = config.lr_max_steps - config.lr_warmup_steps
+
+    # Linear increase until we hit warmup steps
+    if step < config.lr_warmup_steps:
+        return config.max_lr * (step+1) / config.lr_warmup_steps
+
+    # If we have exceeded the max steps used for decay, use minimum LR
+    elif step > config.lr_max_steps:
+        return min_lr
+    
+    # Otherwise, cosine decay. T_cur = the current step number used in decay, T_max
+    # = total steps used for decay. Note that T_cur is different than `step`, since
+    # `step` also counts warmup steps.
+    # https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html
+    else:
+        coeff = 0.5 * (1.0 + math.cos(math.pi * (step - config.lr_warmup_steps) / decay_steps))
+        return min_lr + coeff * (config.max_lr - min_lr)
+
+
 if __name__ == "__main__":
+    # Distributed data processing
+    local_rank, global_rank, world_size = setup_ddp()
+    is_master_process = global_rank == 0
+
     # Use TensorFloat32 datatype (1 sign bit, 8 exponent bits, 10 mantissa bits). This
     # is lower precision that FP32 (23 mantissa bits), which results in faster training
     # by less precision. In practice, the loss is precision is not noticeable.
@@ -422,17 +459,28 @@ if __name__ == "__main__":
     datasets = build_dataset(text_data, model_config._chars_to_index_map, context_len=model_config.block_size)
 
     # Model
-    model = TinyGpt(model_config)
-    model.compile()
-    model.to(DEVICE)
+    device = define_device(local_rank)
+    model = TinyGpt(model_config, device=device).to(device)
+    ddp_model = DDP(model, device_ids=[global_rank])
+    ddp_model.compile()
     
     total_params = sum([p.numel() for p in model.parameters()])
-    print(f"Number of parameters: {total_params}")
+    if is_master_process:
+        print(f"Number of parameters: {total_params}")
 
     # Optimizer
-    optimizer = model.configure_optimizers_with_initial_lr(model_config.max_lr, model_config.weight_decay)
+    optimizer = configure_optimizers_with_initial_lr(
+        ddp_model.parameters(),
+        model_config.max_lr,
+        model_config.weight_decay
+    )
 
     # Training data
+    sampler = DistributedSampler(
+        dataset=datasets["train"],
+        num_replicas=world_size,
+        rank=global_rank
+    )
     training_data_loader = DataLoader(
         dataset=datasets["train"],
         batch_size=(
@@ -440,10 +488,11 @@ if __name__ == "__main__":
             if model_config.accumulate_gradients
             else model_config.batch_size
         ),
-        shuffle=True,
+        sampler=sampler,
+        shuffle=False,
     )
     val_x, val_y = datasets["val"][0]
-    val_x, val_y = val_x.to(DEVICE), val_y.to(DEVICE)
+    val_x, val_y = val_x.to(device), val_y.to(device)
 
     # Training loop
     running_loss = 0.0
@@ -454,39 +503,62 @@ if __name__ == "__main__":
 
         start_time = time.time()
 
-        model.train()
+        ddp_model.train()
         for i, (x, y) in enumerate(training_data_loader):
-            x, y = x.to(DEVICE), y.to(DEVICE)
+            x, y = x.to(device), y.to(device)
 
             optimizer.zero_grad()
 
             # Accumulate gradients. Note that if we are not accumulating gradients, then
             # accumulation_steps will just be 1.
             loss_accum = 0.0
-            for _ in range(model_config.accumulation_steps):
+            accum_steps = model_config.get_accumulation_steps(world_size)
+            for j in range(accum_steps):
                 # Forward pass
-                with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = ddp_model(x, y)
 
-                # Make sure to compute average loss.
-                loss = loss / model_config.accumulation_steps
+                # We want to make sure our loss reporesents average across full batch,
+                # not each micro-batch.
+                loss = loss / accum_steps
                 loss_accum += loss
 
-                # Backward pass
-                loss.backward()
+                # Backward pass. DDP is responsible for syncing gradients during the
+                # backward pass (i.e., collecting gradients from each of the ranks,
+                # averaging them, and depositing those averages onto the ranks). We
+                # don't want to do that for each micro-step, since this is wasteful.
+                if j < accum_steps - 1:
+                    with ddp_model.no_sync():
+                        loss.backward()
+                else:
+                    # Perform AllReduce operation once we have completed all the
+                    # micro-steps.
+                    loss.backward()
+
+            # At this point, loss_accum is the accumulated loss from just a single rank.
+            # Average it across all ranks (i.e., exactly what DDP does for the grads
+            # with loss.backward()).
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
             # LR
-            lr = model.get_lr(i)
+            lr = get_lr(i, model_config)
             for param_groups in optimizer.param_groups:
                 param_groups["lr"] = lr
-            
+
             # Clip gradients
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            norm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
+
+            # Step and synchronize
+            optimizer.step()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
 
             # Batch loss statistics
             running_loss += loss_accum.detach()
             epoch_loss += loss_accum.detach()
-            if i > 0 and (i+1) % 100 == 0:
+
+            # Every 100 batches on the master process, log some statistics
+            if is_master_process and i > 0 and (i+1) % 100 == 0:
                 # Number of tokens processed / second
                 end_time = time.time()
                 batch_elapsed = end_time - start_time
@@ -494,6 +566,7 @@ if __name__ == "__main__":
                     100  # 100 batches
                     * model_config.batch_size  # Each batch has `batch_size` examples
                     * model_config.block_size  # Each example in batch has block_size tokens
+                    * world_size
                 )
                 total_tokens_per_sec = f"Tokens/sec: {(total_tokens / batch_elapsed):.4f}"
                 
@@ -507,20 +580,19 @@ if __name__ == "__main__":
 
                 # Gradient norm
                 gradient_norm = f"Gradient Norm: {norm:.4f}"
-                print(f"Epoch {epoch_num+1:02d} | Batch {(i+1-100):04d}-{i:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
+                if is_master_process:
+                    print(f"Epoch {epoch_num+1:02d} | Batch {(i+1-100):04d}-{i:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
 
                 running_loss = 0
-            
-            optimizer.step()
         
         # Epoch loss
         training_loss.append(epoch_loss / len(training_data_loader))
 
         # Validation loss
-        model.eval()
+        ddp_model.eval()
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                val_logits, val_loss = model(val_x, val_y)
+                val_logits, val_loss = ddp_model(val_x, val_y)
         validation_loss.append(val_loss.item())
 
-    model.generate(torch.tensor([model.encode(START_TOKEN)]))
+    # model.generate(torch.tensor([model.encode(START_TOKEN)]))
