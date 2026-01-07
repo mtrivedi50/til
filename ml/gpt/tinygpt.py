@@ -179,8 +179,8 @@ class TrainConfig(BaseModel):
 
 class TinyGptConfig(BaseModel):
     data: DataConfig
-    model: ModelConfig
-    train: TrainConfig
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    train: TrainConfig = Field(default=TrainConfig)
     
 
 
@@ -212,12 +212,12 @@ class CasualSelfAttention(nn.Module):
         # x = (B, T, C), where C = config.model.n_embd
         B, T, C = x.shape
         k, q, v = self.kqv(x).split(C, dim=-1)  # 3 tensors, each of B, T, C
-        k: torch.Tensor = k.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
-        q: torch.Tensor = q.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
-        v: torch.Tensor = v.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # B, nh, T, head_size
+        k: torch.Tensor = k.view(B, T, self.config.model.n_head, self.config.model.head_size).transpose(1, 2)  # B, nh, T, head_size
+        q: torch.Tensor = q.view(B, T, self.config.model.n_head, self.config.model.head_size).transpose(1, 2)  # B, nh, T, head_size
+        v: torch.Tensor = v.view(B, T, self.config.model.n_head, self.config.model.head_size).transpose(1, 2)  # B, nh, T, head_size
 
         # Attention
-        # wei = q @ k.transpose(-2, -1) * self.config.head_size**-0.5  # B, nh, T, T
+        # wei = q @ k.transpose(-2, -1) * self.config.model.head_size**-0.5  # B, nh, T, T
         # wei = wei.masked_fill(self.tril[:,:,:T,:T] == 0, float('-inf')) # B, nh, T, T
         # wei = F.softmax(wei, dim=-1)
         # out = wei @ v  # (B, nh, T, T) @ (B, nh, T, head_size) --> (B, nh, T, head_size)
@@ -226,7 +226,7 @@ class CasualSelfAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # Confirm output shape
-        expected_shape = torch.Size([B, self.config.n_head, T, self.config.head_size])
+        expected_shape = torch.Size([B, self.config.model.n_head, T, self.config.model.head_size])
         if out.shape != expected_shape:
             raise Exception(f"Unexpected shape of softmax weights @ values {out.shape}, expected: {expected_shape}.")
 
