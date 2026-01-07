@@ -496,7 +496,7 @@ if __name__ == "__main__":
     )
     training_data_loader = DataLoader(
         dataset=datasets["train"],
-        batch_size=cfg.micro_batch_size,
+        batch_size=cfg.train.micro_batch_size,
         sampler=sampler,
         shuffle=False,
         drop_last=True,
@@ -589,7 +589,7 @@ if __name__ == "__main__":
                 batch_elapsed = end_time - start_time
                 total_tokens = (
                     100  # 100 batches
-                    * cfg.micro_batch_size  # Each batch has `micro_batch_size` examples
+                    * cfg.train.micro_batch_size  # Each batch has `micro_batch_size` examples
                     * cfg.model.block_size  # Each example in batch has block_size tokens
                     * world_size
                 )
