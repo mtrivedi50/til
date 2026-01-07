@@ -441,7 +441,6 @@ if __name__ == "__main__":
     # is lower precision that FP32 (23 mantissa bits), which results in faster training
     # by less precision. In practice, the loss is precision is not noticeable.
     torch.set_float32_matmul_precision('high')
-    torch.backends.fp32_precision = "tf32"  # allows TF32 for all applicable ops globally
 
     # Raw data
     text_data = load_data(WKDIR, GPT)
@@ -461,8 +460,8 @@ if __name__ == "__main__":
     # Model
     device = define_device(local_rank)
     model = TinyGpt(model_config, device=device).to(device)
-    ddp_model = DDP(model, device_ids=[global_rank])
-    ddp_model.compile()
+    model = torch.compile(model)
+    ddp_model = DDP(model, device_ids=[local_rank])
     
     total_params = sum([p.numel() for p in model.parameters()])
     if is_master_process:
@@ -479,7 +478,8 @@ if __name__ == "__main__":
     sampler = DistributedSampler(
         dataset=datasets["train"],
         num_replicas=world_size,
-        rank=global_rank
+        rank=global_rank,
+        drop_last=True
     )
     training_data_loader = DataLoader(
         dataset=datasets["train"],
@@ -490,6 +490,7 @@ if __name__ == "__main__":
         ),
         sampler=sampler,
         shuffle=False,
+        drop_last=True,
     )
     val_x, val_y = datasets["val"][0]
     val_x, val_y = val_x.to(device), val_y.to(device)
@@ -499,57 +500,66 @@ if __name__ == "__main__":
     training_loss = []
     validation_loss = []
     for epoch_num in range(model_config.num_epochs):
+        # Epoch-level sampling
+        sampler.set_epoch(epoch_num)
+
+        # Loss. loss_accum accumulates loss over micro-batches, epoch_loss measures
+        # average loss across all batches in the epoch.
+        loss_accum = 0.0
         epoch_loss = 0.0
+
+        # Accumulate gradients. Note that if we are not accumulating gradients, then
+        # accumulation_steps will just be 1.
+        accum_steps = model_config.get_accumulation_steps(world_size)
 
         start_time = time.time()
 
+        # Zero out gradients
         ddp_model.train()
-        for i, (x, y) in enumerate(training_data_loader):
+        optimizer.zero_grad(set_to_none=True)
+
+        for step, (x, y) in enumerate(training_data_loader):
             x, y = x.to(device), y.to(device)
 
-            optimizer.zero_grad()
+            # Forward pass
+            with torch.autocast(device_type="cuda" if "cuda" in device else device, dtype=torch.bfloat16):
+                logits, loss = ddp_model(x, y)
 
-            # Accumulate gradients. Note that if we are not accumulating gradients, then
-            # accumulation_steps will just be 1.
-            loss_accum = 0.0
-            accum_steps = model_config.get_accumulation_steps(world_size)
-            for j in range(accum_steps):
-                # Forward pass
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = ddp_model(x, y)
+            # Our data loader loads micro-batches. We want to make sure our loss
+            # represents average across full batch, not each micro-batch.
+            loss = loss / accum_steps
+            loss_accum += loss
 
-                # We want to make sure our loss reporesents average across full batch,
-                # not each micro-batch.
-                loss = loss / accum_steps
-                loss_accum += loss
-
-                # Backward pass. DDP is responsible for syncing gradients during the
-                # backward pass (i.e., collecting gradients from each of the ranks,
-                # averaging them, and depositing those averages onto the ranks). We
-                # don't want to do that for each micro-step, since this is wasteful.
-                if j < accum_steps - 1:
-                    with ddp_model.no_sync():
-                        loss.backward()
-                else:
-                    # Perform AllReduce operation once we have completed all the
-                    # micro-steps.
+            # Backward pass. DDP is responsible for syncing gradients during the
+            # backward pass (i.e., collecting gradients from each of the ranks,
+            # averaging them, and depositing those averages onto the ranks). We
+            # don't want to do that for each micro-step, since this is wasteful.
+            if (step + 1) % accum_steps != 0:
+                with ddp_model.no_sync():
                     loss.backward()
+                continue  # continue to next step (i.e., micro-batch)
+            
+            # last microstep: sync + AllReduce step.
+            loss.backward()
 
             # At this point, loss_accum is the accumulated loss from just a single rank.
-            # Average it across all ranks (i.e., exactly what DDP does for the grads
-            # with loss.backward()).
+            # Average it across all ranks.
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
             # LR
-            lr = get_lr(i, model_config)
+            # TODO - LR should scale based on number of tokens, not number of steps.
+            global_step = epoch_num * len(training_data_loader) + step
+            lr = get_lr(global_step, model_config)
             for param_groups in optimizer.param_groups:
                 param_groups["lr"] = lr
 
             # Clip gradients
             norm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
 
-            # Step and synchronize
+            # Step
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
 
@@ -557,14 +567,18 @@ if __name__ == "__main__":
             running_loss += loss_accum.detach()
             epoch_loss += loss_accum.detach()
 
-            # Every 100 batches on the master process, log some statistics
-            if is_master_process and i > 0 and (i+1) % 100 == 0:
+            # Reset loss_accum, since we need to accumulate it over the next
+            # micro-batch.
+            loss_accum = 0.0
+
+            # Every 100 micro-batches on the master process, log some statistics
+            if is_master_process and step > 0 and (step+1) % 100 == 0:
                 # Number of tokens processed / second
                 end_time = time.time()
                 batch_elapsed = end_time - start_time
                 total_tokens = (
                     100  # 100 batches
-                    * model_config.batch_size  # Each batch has `batch_size` examples
+                    * model_config.micro_batch_size  # Each batch has `micro_batch_size` examples
                     * model_config.block_size  # Each example in batch has block_size tokens
                     * world_size
                 )
@@ -581,18 +595,21 @@ if __name__ == "__main__":
                 # Gradient norm
                 gradient_norm = f"Gradient Norm: {norm:.4f}"
                 if is_master_process:
-                    print(f"Epoch {epoch_num+1:02d} | Batch {(i+1-100):04d}-{i:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
+                    print(f"Epoch {epoch_num+1:02d} | Batch {(step+1-100):04d}-{step:04d} | {average_loss} | {gradient_norm} | {total_tokens_per_sec} | {total_step_time} | {avg_step_time}")
 
                 running_loss = 0
         
-        # Epoch loss
-        training_loss.append(epoch_loss / len(training_data_loader))
+        # epoch_loss is the sum of average loss across all ranks for each batch in our
+        # dataset. Take average by dividing it by the number of batches.
+        num_opt_steps = len(training_data_loader) // accum_steps
+        training_loss.append(epoch_loss / num_opt_steps)
 
         # Validation loss
-        ddp_model.eval()
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                val_logits, val_loss = ddp_model(val_x, val_y)
-        validation_loss.append(val_loss.item())
+        if is_master_process:
+            ddp_model.eval()
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda" if "cuda" in device else device, dtype=torch.bfloat16):
+                    val_logits, val_loss = ddp_model(val_x, val_y)
+            validation_loss.append(val_loss.item())
 
     # model.generate(torch.tensor([model.encode(START_TOKEN)]))
