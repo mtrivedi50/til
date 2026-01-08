@@ -622,6 +622,8 @@ if __name__ == "__main__":
 
         # Validation loss. Our model weights have been synchronized across all ranks, so
         # only run validation test on the master process.
+
+        # TODO -- we should probably do this in the training loop itself
         if is_master_process:
             ddp_model.eval()
             with torch.no_grad():
