@@ -66,16 +66,16 @@ class CharacterLMDataset(Dataset):
 
 def build_dataset(
     text: str,
-    chars_to_i: dict[str, int],
+    stoi: dict[str, int],
     train_size: float = 0.8,
     val_size: float = 0.1,
     context_len: int = 8,
 ) -> dict[Literal["train", "val", "test"], CharacterLMDataset]:
     
-    def _encode(text: str, chars_to_i: str) -> list[int]:
-        return [chars_to_i[c] for c in text]
+    def _encode(text: str, stoi: str) -> list[int]:
+        return [stoi[c] for c in text]
 
-    data = torch.tensor(_encode(text, chars_to_i), dtype=torch.long)
+    data = torch.tensor(_encode(text, stoi), dtype=torch.long)
 
     if train_size + val_size > 1:
         raise Exception("Training and validation sizes exceed 100%!")

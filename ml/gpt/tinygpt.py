@@ -47,17 +47,13 @@ def setup_ddp() -> tuple[int, int, int]:
     if not torch.cuda.is_available():
         raise Exception("DDP can only run on CUDA!")
 
-    # Initialize the process group using NCCL backend. Can potentially use the code
-    # below to automatically select backend?
-    #     acc = torch.accelerator.current_accelerator()
-    #     backend = torch.distributed.get_default_backend_for_device(acc)
     init_process_group(backend="nccl")
     
     # Rank and world size are automatically calculated via `torchrun` and injected via
     # environment variables.
-    local_rank = int(os.environ["LOCAL_RANK"])
-    global_rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))  # unique ID for process within current node
+    global_rank = int(os.environ.get("RANK", 0))  # unique ID for process across all nodes
+    world_size = int(os.environ.get("WORLD_SIZE", 1))  # total number of processes across all noodes
     torch.cuda.set_device(local_rank)
     return local_rank, global_rank, world_size
 
@@ -181,7 +177,6 @@ class TinyGptConfig(BaseModel):
     data: DataConfig
     model: ModelConfig = Field(default_factory=ModelConfig)
     train: TrainConfig = Field(default=TrainConfig)
-    
 
 
 class CasualSelfAttention(nn.Module):
@@ -424,27 +419,36 @@ def get_lr(step: int, config: TinyGptConfig) -> float:
         1) Linear warmup
         2) Cosine decay
     """
+    # Our step counts begins at 0. If there are 1000 warmup steps, we achieve this when
+    # step = 999.
+    step = step + 1
+
     min_lr = config.train.max_lr * 0.1
     decay_steps = config.train.lr_max_steps - config.train.lr_warmup_steps
 
     # Linear increase until we hit warmup steps
     if step < config.train.lr_warmup_steps:
-        return config.train.max_lr * (step+1) / config.train.lr_warmup_steps
+        return config.train.max_lr * step / config.train.lr_warmup_steps
 
     # If we have exceeded the max steps used for decay, use minimum LR
     elif step > config.train.lr_max_steps:
         return min_lr
     
-    # Otherwise, cosine decay. T_cur = the current step number used in decay, T_max
-    # = total steps used for decay. Note that T_cur is different than `step`, since
-    # `step` also counts warmup steps.
+    # Otherwise, cosine decay. See docs:
     # https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html
+    #
+    # T_cur = the current step number used in decay, T_max = total steps used for decay.
+    # Note that T_cur is different than `step`, since `step` also counts warmup steps.
     else:
-        coeff = 0.5 * (1.0 + math.cos(math.pi * (step - config.train.lr_warmup_steps) / decay_steps))
+        cur_decay_step = step - config.train.lr_warmup_steps
+        coeff = 0.5 * (1.0 + math.cos(math.pi * cur_decay_step / decay_steps))
         return min_lr + coeff * (config.train.max_lr - min_lr)
 
 
 if __name__ == "__main__":
+    # TODO -- right now, this script assumes DDP. I could generalize it further to run
+    # with/without DDP.
+
     # Distributed data processing
     local_rank, global_rank, world_size = setup_ddp()
     is_master_process = global_rank == 0
@@ -496,7 +500,7 @@ if __name__ == "__main__":
     )
     training_data_loader = DataLoader(
         dataset=datasets["train"],
-        batch_size=cfg.train.micro_batch_size,
+        batch_size=cfg.train.micro_batch_size,  # gradient accumulation!
         sampler=sampler,
         shuffle=False,
         drop_last=True,
@@ -509,16 +513,16 @@ if __name__ == "__main__":
     training_loss = []
     validation_loss = []
     for epoch_num in range(cfg.train.num_epochs):
-        # Epoch-level sampling
+        # Per the docs, necessary to make shuffling work across multiple epochs, and
+        # must be called before iterating through the data loader.
+        # https://docs.pytorch.org/docs/stable/data.html
         sampler.set_epoch(epoch_num)
 
-        # Loss. loss_accum accumulates loss over micro-batches, epoch_loss measures
-        # average loss across all batches in the epoch.
+        # loss_accum accumulates loss over micro-batches, epoch_loss measures average
+        # loss across all batches in the epoch.
         loss_accum = 0.0
         epoch_loss = 0.0
 
-        # Accumulate gradients. Note that if we are not accumulating gradients, then
-        # accumulation_steps will just be 1.
         accum_steps = cfg.train.get_accumulation_steps(world_size)
 
         start_time = time.time()
@@ -543,12 +547,12 @@ if __name__ == "__main__":
             # backward pass (i.e., collecting gradients from each of the ranks,
             # averaging them, and depositing those averages onto the ranks). We
             # don't want to do that for each micro-step, since this is wasteful.
-            if (step + 1) % accum_steps != 0:
+            if (step+1) % accum_steps != 0:
                 with ddp_model.no_sync():
                     loss.backward()
                 continue  # continue to next step (i.e., micro-batch)
             
-            # last microstep: sync + AllReduce step.
+            # last microstep: sync + AllReduce step for gradients.
             loss.backward()
 
             # At this point, loss_accum is the accumulated loss from just a single rank.
@@ -576,8 +580,8 @@ if __name__ == "__main__":
             running_loss += loss_accum.detach()
             epoch_loss += loss_accum.detach()
 
-            # Reset loss_accum, since we need to accumulate it over the next
-            # micro-batch.
+            # Reset loss_accum, since we need to accumulate it starting from 0 with the
+            # next micro-batch.
             loss_accum = 0.0
 
             # Every 100 optimization steps (i.e., every 100 * accum_steps micro-batches)
@@ -588,10 +592,10 @@ if __name__ == "__main__":
                 end_time = time.time()
                 batch_elapsed = end_time - start_time
                 total_tokens = (
-                    100  # 100 batches
-                    * cfg.train.micro_batch_size  # Each batch has `micro_batch_size` examples
+                    100  # 100 optimization steps
+                    * cfg.train.micro_batch_size * accum_steps  # Each optimization step has accum_steps micro-batches
+                    * world_size  # We've run accum_steps micro-batches over world_size processes
                     * cfg.model.block_size  # Each example in batch has block_size tokens
-                    * world_size
                 )
                 total_tokens_per_sec = f"Tokens/sec: {(total_tokens / batch_elapsed):.4f}"
                 
