@@ -629,4 +629,5 @@ if __name__ == "__main__":
                     val_logits, val_loss = ddp_model(val_x, val_y)
             validation_loss.append(val_loss.item())
 
+    cleanup()
     # model.generate(torch.tensor([model.encode(START_TOKEN)]))
