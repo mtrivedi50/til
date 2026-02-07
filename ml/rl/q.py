@@ -165,8 +165,7 @@ def train(params: TrainingHyperparams, q_table: np.ndarray, env: gym.Env):
 
 
 if __name__ == "__main__":
-        env = make_env()
-        q_table = initialize_q_table(env.observation_space.n, env.action_space.n) 
-        params = TrainingHyperparams()
-        train(params, q_table, env)
-
+    env = make_env()
+    q_table = initialize_q_table(env.observation_space.n, env.action_space.n) 
+    params = TrainingHyperparams()
+    train(params, q_table, env)
