@@ -7,6 +7,8 @@ import numpy as np
 import random
 from typing import Literal
 from pydantic import BaseModel, Field
+import math
+
 
 # Make FrozenLake environment
 def make_env():
