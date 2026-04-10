@@ -214,9 +214,6 @@ class QFunctionParams(BaseModel):
     input: InputParams = Field(
         default_factory=InputParams
     )
-    model: ModelParams = Field(
-        default_factory=ModelParams
-    )
     n_actions: int = Field(
         default=4,
         description="Number of actions in our environment."
@@ -228,19 +225,20 @@ class QFunction(nn.Module):
     def __init__(self, params: QFunctionParams):
         super().__init__()
         self.params = params
-        self.conv = []
-
-        for p in params.model.conv2d_params:
-            self.conv.append(
-                nn.Conv2d(p.ch, p.out, p.kernel, p.stride, dtype=torch.float32)
-            )
-            self.conv.append(nn.ReLU())
-
-        # Dims for the convolutional layers' output channels
-        conv2d_outputs = params.model.conv2d_output_channel_dims(
-            params.input.height,
-            params.input.width
-        )
+        self.conv = [
+            # width = 84 --> (84 - 8)/4 + 1 = 20
+            # height = 84 --> (84 - 8)/4 + 1 = 20
+            nn.Conv2d(in_channels=params.input.channels, out_channels=32, kernel_size=8, stride=4),  # B x 32 x 20 x 20
+            nn.ReLU(),
+            # width = 20 --> (20 - 4)/2 + 1 = 9
+            # height = 20 --> (20 - 4)/2 + 1= 9
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),  # B x 64 x 9 x 9
+            nn.ReLU(),
+            # width = 9 --> (9 - 4)/1 + 1 = 6
+            # height = 9 --> (9 - 4)/1 + 1 = 6
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1),  # B x 64 x 6 x 6
+            nn.ReLU(),
+        ]
         
         # Number of input channels for first linear layer of MLP.
         # Convolutional layers outputs tensor of shape (C, H, W)
@@ -248,9 +246,7 @@ class QFunction(nn.Module):
         # H = height of output map
         # W = width of output map
         # We flatten this to a 1-D tensor
-        linear_in = (
-            params.model.conv2d_params[-1].out * conv2d_outputs[-1][0] * conv2d_outputs[-1][1]
-        )
+        linear_in = 64 * 6 * 6
         self.mlp = [
             nn.Flatten(),
             nn.Linear(int(linear_in), 512),
@@ -334,7 +330,7 @@ def train(
 
                 # Update action model
                 if (training_step+1) % params.train.n_steps_reset_action_model == 0:
-                    for k, v in training_step.state_dict():
+                    for k, v in model.state_dict().items():
                         action_model.state_dict()[k] = v
                     training_step = 0
                 
@@ -357,10 +353,3 @@ if __name__ == "__main__":
     optim = torch.optim.AdamW(params=train_model.parameters(), lr=p.train.lr, betas=(0.9, 0.95), eps=1e-8)
     state, _ = env.reset()
     train(env, train_model, action_model, optim)
-
-    
-
-
-
-
-
