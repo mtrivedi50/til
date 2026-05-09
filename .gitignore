@@ -211,3 +211,4 @@ __marimo__/
 
 # Training data
 ml/gpt/input.txt
+**/data/
