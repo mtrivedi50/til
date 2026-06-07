@@ -24,6 +24,7 @@ dependencies = [
     "pyvirtualdisplay>=3.0",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.7.2",
+    "tensorboard>=2.20.0",
     "torch==2.8.0",
     "torchcodec==0.7",
     "torchvision>=0.23.0",
