@@ -104,7 +104,8 @@ def load_ucf101(
 
 class UCF101Dataset(Dataset):
 
-   def __init__(self, ucf101: UCF101):
+   def __init__(self, device: str, ucf101: UCF101):
+      self.device = device
       self.ucf101 = ucf101
 
    def __len__(self):
@@ -126,6 +127,10 @@ class UCF101Dataset(Dataset):
          # choose a random index.
          # https://github.com/meta-pytorch/torchcodec/issues
          if "Requested next frame while there are no more frames left to decode" in str(e):
+            # Keep track
+            with open(WKDIR / f"corrupted_{self.device}.txt", "a") as f:
+               f.write(idx)
+               
             idx = random.randint(0, len(self.ucf101)-1)
             return self._get(idx)
          raise
@@ -445,6 +450,7 @@ def train(
       sampler.set_epoch(epoch_num)
 
       # Initial evaluation
+      # We expect initial loss to be ~1% (guessing randomly from 100 classes)
       ddp_model.eval()
       val_stats = evaluate(
          ddp_model,
