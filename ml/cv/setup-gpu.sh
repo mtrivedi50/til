@@ -13,10 +13,9 @@ VENV_EXISTS=$(ssh -i ${PEM_KEY} ${USERNAME}@${HOST} "test -f /home/${USERNAME}/p
 if [[ $VENV_EXISTS == "no" ]]; then
     ssh -i ${PEM_KEY} ${USERNAME}@${HOST} "curl -LsSf https://astral.sh/uv/install.sh | sh"
     ssh -i ${PEM_KEY} ${USERNAME}@${HOST} "
-        alias uv="~/.local/bin/uv"
-        uv init . &&
-        uv python install 3.13 &&
-        uv python pin 3.13 &&
-        uv add pydantic torchvision torch tensorboard &&
-        uv add torchcodec --index=https://download.pytorch.org/whl/cu130"
+        ~/.local/bin/uv init . &&
+        ~/.local/bin/uv python install 3.13 &&
+        ~/.local/bin/uv python pin 3.13 &&
+        ~/.local/bin/uv add pydantic torchvision torch tensorboard &&
+        ~/.local/bin/uv add torchcodec --index=https://download.pytorch.org/whl/cu130"
 fi

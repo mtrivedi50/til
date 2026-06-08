@@ -77,7 +77,8 @@ def load_ucf101(
    frames_per_clip: int = 8,
    steps_between_clips: int = 1,
    output_format: str = "TCHW",
-   train_size: float = 0.98
+   train_size: float = 0.98,
+   is_master_process: bool = False,
 ) -> tuple[Subset, Subset, Subset]:
    ucf101 = UCF101(
       root=root,
@@ -86,14 +87,15 @@ def load_ucf101(
       step_between_clips=steps_between_clips,
       output_format=output_format
    )
-   print("==================== DATA SUMMARY ====================")
-   print(f"There are {len(ucf101)} video clips. Each clip is of type {ucf101[0].__class__.__name__}.")
-   print(f"Each {ucf101[0].__class__.__name__} has length {len(ucf101[0])}, which corresponds to video, audio, label.")
-   print("Example clip:")
-   print(f"Video shape: {ucf101[0][0].shape}")
-   print(f"Audio shape: {ucf101[0][1].shape}")
-   print(f"Label: {ucf101[0][2]}")
-   print("======================================================")
+   if is_master_process:
+      print("==================== DATA SUMMARY ====================")
+      print(f"There are {len(ucf101)} video clips. Each clip is of type {ucf101[0].__class__.__name__}.")
+      print(f"Each {ucf101[0].__class__.__name__} has length {len(ucf101[0])}, which corresponds to video, audio, label.")
+      print("Example clip:")
+      print(f"Video shape: {ucf101[0][0].shape}")
+      print(f"Audio shape: {ucf101[0][1].shape}")
+      print(f"Label: {ucf101[0][2]}")
+      print("======================================================")
 
    # Training / validation / test split
    test_val_size = 1 - train_size
@@ -129,7 +131,7 @@ class UCF101Dataset(Dataset):
          if "Requested next frame while there are no more frames left to decode" in str(e):
             # Keep track
             with open(WKDIR / f"corrupted_{self.device}.txt", "a") as f:
-               f.write(idx)
+               f.write(str(idx))
                
             idx = random.randint(0, len(self.ucf101)-1)
             return self._get(idx)
@@ -405,6 +407,7 @@ def train(
    num_epochs: int = 10_000,
    lr: float = 1e-3,
    weight_decay: float = 1e-4,
+   is_master_process: bool = False
 ):
    sampler = DistributedSampler(
       dataset=train_dataset,
@@ -449,17 +452,19 @@ def train(
       # To ensure random shuffling at every epoch
       sampler.set_epoch(epoch_num)
 
-      # Initial evaluation
-      # We expect initial loss to be ~1% (guessing randomly from 100 classes)
-      ddp_model.eval()
-      val_stats = evaluate(
-         ddp_model,
-         val_dataloader,
-         batch_size,
-         device,
-      )
-      ddp_model.train()
-      print(f"val loss: {val_stats.loss:.4f} | val accuracy: {val_stats.accuracy:.4f}")
+      # Initial evaluation. At epoch 0, we expect initial accuracy to be ~1% (guessing
+      # randomly from 101 classes). And, we expect initial loss to be ~4.6.
+      # loss = -log(p_correct), and p_correct = 1/101.
+      if is_master_process:
+         ddp_model.eval()
+         val_stats = evaluate(
+            ddp_model,
+            val_dataloader,
+            batch_size,
+            device,
+         )
+         ddp_model.train()
+         print(f"val loss: {val_stats.loss:.4f} | val accuracy: {val_stats.accuracy:.4f}")
       
       # Training mode      
       ddp_model.train()
@@ -507,7 +512,7 @@ def train(
             # Gradients
             # Total gradient norm
             total_norm = torch.nn.utils.get_total_norm(model.parameters())
-            for name, module in model.named_modules():
+            for name, module in ddp_model.named_modules():
                parameters = [p for p in module.parameters(recurse=False) if p.grad is not None]
                if parameters:
                   layer_grad_norm = torch.stack([p.grad.norm() ** 2 for p in parameters]).sum().sqrt()
@@ -552,6 +557,8 @@ if __name__ == "__main__":
    local_rank, global_rank, world_size = setup_ddp()
    device = define_device(local_rank)
    is_master_process = global_rank == 0
+
+   torch.set_float32_matmul_precision('high')
 
    # Model
    model = ActionRecognitionModel(
@@ -609,12 +616,13 @@ if __name__ == "__main__":
 
    train_subset, test_subset, val_subset = load_ucf101(
       root=DATA / 'ucf101',
-      annotation_path=DATA / 'annotations'
+      annotation_path=DATA / 'annotations',
+      is_master_process=is_master_process,
    )
-   train_dataset = UCF101Dataset(train_subset)
-   val_dataset = UCF101Dataset(val_subset)
+   train_dataset = UCF101Dataset(device, train_subset)
+   val_dataset = UCF101Dataset(device, val_subset)
    if is_master_process:
-      print("==================== DATA SUMMARY ====================")
+      print("===================== DATA SPLIT =====================")
       print(f"Training dataset: {len(train_subset)} videos")
       print(f"Validation dataset: {len(val_subset)} videos")
       print(f"Test dataset: {len(test_subset)} videos")
@@ -629,6 +637,7 @@ if __name__ == "__main__":
          global_rank=global_rank,
          ddp_model=ddp_model,
          activations=activations,
+         is_master_process=is_master_process,
       )
    except Exception:
       raise
