@@ -1,13 +1,14 @@
 """
 Basic CNN for action recognition.
 """
-
+from functools import cached_property
 from dataclasses import dataclass
 import torch
 from torch import nn
 import torch.nn.functional as F
 from pathlib import Path
 from torchvision.datasets import UCF101
+from torchvision.transforms import v2
 import math
 from pydantic import BaseModel, Field, model_validator
 from typing import Any, Literal
@@ -60,16 +61,21 @@ def cleanup():
 def define_device(local_rank: int | None = None):
    if torch.cuda.is_available():
       if local_rank is not None:
-         return f"cuda:{local_rank}"
+         return torch.device(f"cuda:{local_rank}")
       else:
-         return "cuda"
+         return torch.device("cuda")
    elif torch.mps.is_available():
-      return "mps"
+      return torch.device("mps")
    else:
-      return "cpu"
+      return torch.device("cpu")
 
 
 # ===== Load data ===== #
+
+transform = v2.Compose([
+   v2.Resize((128,128)),
+   v2.ToDtype(torch.float32, scale=True),
+])
 
 def load_ucf101(
    root: Path,
@@ -115,10 +121,12 @@ class UCF101Dataset(Dataset):
    
    def _get(self, idx):
       video, _, label = self.ucf101[idx]
+      video = transform(video)
+      video = video.transpose(0, 1)
+
       # Conv3d expects: (C, D, H, W). We load (D, C, H, W) → permute to (batch,
       # channels, frames, height, width)
-      video = video.transpose(0, 1)
-      return video.float(), label
+      return video, label
    
    def __getitem__(self, idx):
       try:
@@ -171,15 +179,6 @@ class Conv3dParams(ModelParams):
             data[key] = (val, val, val)
       return data
 
-   def create_module(self) -> nn.Module:
-      return nn.Conv3d(
-         in_channels=self.in_channels,
-         out_channels=self.out_channels,
-         kernel_size=self.kernel_size,
-         stride=self.stride,
-         padding=self.padding,
-      )
-
 
 class MaxPool3dParams(ModelParams):
    kernel_size: tuple[int, int, int] = Field(default=(2,2,2))
@@ -195,50 +194,89 @@ class MaxPool3dParams(ModelParams):
             data[key] = (val, val, val)
       return data
 
-   def create_module(self) -> nn.Module:
-      return nn.MaxPool3d(
-         kernel_size=self.kernel_size,
-         stride=self.stride,
-         padding=self.padding,
-      )
 
-
-class ModelBlock(BaseModel):
+class VGGBlockParams(BaseModel):
    num_convs: int
    conv3d_params: Conv3dParams
    nonlin: Literal["relu", "gelu"] | None
    maxpool3d_params: MaxPool3dParams
 
-   def create_module(self) -> nn.Module:
-      layers = []
-      for i in range(self.num_convs):
-         # For sequential convolutional layers, only the last layer should have
-         # `out_channels` output channels. All other ones should have `out_channels` =
-         # `in_channels.``
-         if i < self.num_convs - 1:
-            out_channels = self.conv3d_params.in_channels
-         else:
-            out_channels = self.conv3d_params.out_channels
-         conv3d_params_copy = self.conv3d_params.model_copy(
-            update={"out_channels": out_channels}
-         )
-         layers.append(conv3d_params_copy.create_module())
-         
-         if self.nonlin == "relu":
-            layers.append(nn.ReLU())
-         elif self.nonlin == "gelu":
-            layers.append(nn.GELU())
-      layers.append(self.maxpool3d_params.create_module())
-      return nn.Sequential(*layers)
+
+class VGGBlock(nn.Module):
    
-   def compute_output_dim(self, input_dims: tuple[int, int, int]) -> tuple[int, int, int]:
+   def __init__(self,
+      num_convs: int,
+      conv3d_params: Conv3dParams,
+      nonlin: Literal["relu", "gelu"] | None,
+      maxpool3d_params: MaxPool3dParams,
+      input_dims: tuple[int, int, int],
+      add_residual_cxn: bool = False,
+   ):
+      super().__init__()
+
+      self.num_convs = num_convs
+      self.conv3d_params = conv3d_params
+      self.maxpool3d_params = maxpool3d_params
+      self.input_dims = input_dims
+      self.add_residual_cxn = add_residual_cxn
+      
+      layers = []
+      for i in range(num_convs):         
+         layers.append(
+            nn.Conv3d(
+               in_channels=conv3d_params.in_channels if i == 0 else conv3d_params.out_channels,
+               out_channels=conv3d_params.out_channels,
+               kernel_size=conv3d_params.kernel_size,
+               stride=conv3d_params.stride,
+               padding=conv3d_params.stride,
+            )
+         )
+         if nonlin == "relu":
+            layers.append(nn.ReLU())
+         elif nonlin == "gelu":
+            layers.append(nn.GELU())
+
+      layers.append(
+         nn.MaxPool3d(
+            kernel_size=maxpool3d_params.kernel_size,
+            stride=maxpool3d_params.stride,
+            padding=maxpool3d_params.padding,
+         )
+      )      
+      self.layers = nn.Sequential(*layers)
+
+      # Add a residual connection
+      if self.add_residual_cxn:
+         # This will automatically error if the dimensions do not match...
+         self.shortcut = nn.Sequential(
+            nn.Conv3d(
+               in_channels=conv3d_params.in_channels,
+               out_channels=conv3d_params.out_channels,
+               kernel_size=1,
+               stride=(
+                  self.input_dims[0] // self.output_dims[0],
+                  self.input_dims[1] // self.output_dims[1],
+                  self.input_dims[2] // self.output_dims[2],
+               ),
+               padding=0,
+            )
+         )
+   
+   @cached_property
+   def output_dims(self) -> tuple[int, int, int]:
       # Calculate output dims as we apply sequential convolutions. Note that, for
       # filters of size 3x3x3 with padding = 1 and stride = 1, the dimensions do not
       # change.
-      cur = input_dims
+      cur = self.input_dims
       for _ in range(self.num_convs):
          cur = self.conv3d_params.compute_output_dim(cur)
       return self.maxpool3d_params.compute_output_dim(cur)
+
+   def forward(self, x: torch.Tensor):
+      out = self.layers(x)
+      if self.add_residual:
+         out = out + self.shortcut(x)
+      return out
 
 
 @dataclass
@@ -253,22 +291,22 @@ class ActionRecognitionModel(nn.Module):
       self,
       input_dims: tuple[int, int, int],
       num_classes: int,
-      blocks: list[ModelBlock],
+      blocks: list[VGGBlockParams],
    ):
       super().__init__()
 
+      # Conv Blocks
       self._num_blocks = len(blocks)
-
-      output_dims = input_dims
-      for i, b in enumerate(blocks):
-         setattr(self, f"block{i}", b.create_module())
-         output_dims = b.compute_output_dim(output_dims)
+      for i, params in blocks:
+            cur_block = VGGBlock(**params, input_dims=input_dims)
+            setattr(self, f"block{i}", cur_block)
+            input_dims = cur_block.output_dims
 
       # FC
       self.flatten = nn.Flatten()
       self.fc1 = nn.Sequential(
          nn.Linear(
-            math.prod(output_dims) * blocks[-1].conv3d_params.out_channels,
+            math.prod(blocks[-1].output_dims) * blocks[-1].conv3d_params.out_channels,
             256
          ),
          nn.BatchNorm1d(num_features=256),
@@ -316,8 +354,19 @@ class ActionRecognitionModel(nn.Module):
          x = _print_layer(x, self.flatten)
 
          # FCs
-         x = _print_layer(x, self.fc1)
-         x = _print_layer(x, self.fc2)
+         i = self._num_blocks
+         out1 = _print_layer(x, self.fc1)
+         if isinstance(self.fc1, nn.Sequential):
+            self.print_sequential_arch(i, self.fc1, x)
+         x = out1
+         i += 1
+
+         out2 = _print_layer(x, self.fc2)
+         if isinstance(self.fc2, nn.Sequential):
+            self.print_sequential_arch(i, self.fc2, x)
+         x = out2
+         i += 1
+
          _print_layer(x, self.fc3)
 
    def forward(self, x: torch.Tensor):
@@ -342,6 +391,9 @@ def create_activations_forward_hooks(
 
    def _make_forward_hook(name: str):
       def _hook(module: nn.Module, input: torch.Tensor, output: torch.Tensor):
+         if isinstance(module, nn.Sequential):
+            return
+         
          # Convolutional layer - since we apply ReLU, only look at output > 0
          if output.ndim == 5:
             alive = (output > 0).float().mean(dim=[0, 2, 3, 4])  # shape: (channels,)
@@ -350,8 +402,8 @@ def create_activations_forward_hooks(
          # FC layers - we apply batch norm, so the fraction of alive neurons should
          # hover around 50%.
          else:
-            alive = (output > 0).float().mean(dim=0)
-            magnitude = output.abs().mean(dim=0)
+            alive = (output > 0).float().mean(dim=0)  # average across all batch examples
+            magnitude = output.abs().mean(dim=0)  # average across all batch examples
 
          activations[name] = {"alive": alive, "magnitude": magnitude}
 
@@ -379,8 +431,7 @@ def evaluate(
          preds = ddp_model(videos)  # N x num_classes
 
          # Loss
-         loss = nn.CrossEntropyLoss()
-         val_loss = loss(preds, labels).item()  # default is mean across the batch
+         val_loss = F.cross_entropy(preds, labels).item()  # default is mean across the batch
          running_loss += (val_loss * batch_size)
 
          # Accuracy
@@ -404,7 +455,7 @@ def train(
    ddp_model: DDP,
    activations: dict[str, torch.Tensor],
    batch_size: int = 32,
-   num_epochs: int = 10_000,
+   num_epochs: int = 100,
    lr: float = 1e-3,
    weight_decay: float = 1e-4,
    is_master_process: bool = False
@@ -420,6 +471,7 @@ def train(
       dataset=train_dataset,
       batch_size=batch_size,
       sampler=sampler,
+      num_workers=16,
       shuffle=False,  # shuffle handled by sampler
       drop_last=True,
    )
@@ -434,6 +486,7 @@ def train(
       dataset=val_dataset,
       batch_size=batch_size,
       sampler=val_sampler,
+      num_workers=16,
       shuffle=False,
       drop_last=True,
    )
@@ -483,8 +536,9 @@ def train(
          videos, labels = videos.to(device), labels.to(device)
 
          # Forward pass
-         out = ddp_model(videos)
-         loss = criterion(out, labels)
+         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            out = ddp_model(videos)
+            loss = criterion(out, labels)
 
          # Loss statistics
          running_loss += loss
@@ -494,6 +548,7 @@ def train(
          # pass (collecting gradients from each of the ranks, averaging them, depositing
          # averages onto the ranks).
          loss.backward()
+         total_norm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
 
          # Training statistics
          global_step += 1
@@ -506,18 +561,22 @@ def train(
             for name, activation_stats in activations.items():
                alive = activation_stats["alive"]
                magnitude = activation_stats["magnitude"]
-               writer.add_histogram(f"activations/{name}/alive", alive, global_step=global_step)
-               writer.add_histogram(f"activations/{name}/magnitude", magnitude, global_step=global_step)
+               writer.add_histogram(f"{name}/activations/alive", alive, global_step=global_step)
+               writer.add_histogram(f"{name}/activations", magnitude, global_step=global_step)
             
-            # Gradients
-            # Total gradient norm
-            total_norm = torch.nn.utils.get_total_norm(model.parameters())
-            for name, module in ddp_model.named_modules():
-               parameters = [p for p in module.parameters(recurse=False) if p.grad is not None]
-               if parameters:
-                  layer_grad_norm = torch.stack([p.grad.norm() ** 2 for p in parameters]).sum().sqrt()
-                  writer.add_scalar(f"gradients/{name}/layer_grad_norm", layer_grad_norm, global_step=global_step)
-         
+            # Weights / gradients
+            for name, param in ddp_model.named_parameters():
+               # For DDP, the names are something like "module._orig_mod.block..."
+               name, param_type = ".".join(name.split(".")[2:-1]), name.split(".")[-1]
+               if param.grad is not None:
+                  writer.add_histogram(f"{name}/{param_type}/gradients", param.grad, global_step=global_step)
+               writer.add_histogram(f"{name}/{param_type}", param, global_step=global_step)
+
+            writer.add_scalar(f"total_gradient_norm", total_norm, global_step=global_step)
+
+            # Loss
+            writer.add_scalar(f"train_loss", running_loss/100.0, global_step=global_step)
+
             if training_step % 1000 == 0:
                ddp_model.eval()
                val_stats = evaluate(
@@ -526,6 +585,10 @@ def train(
                   batch_size,
                   device,
                )
+
+               # Validation loss
+               writer.add_scalar(f"val_loss", val_stats.loss, global_step=global_step)
+
                ddp_model.train()
             else:
                # Dummy stats for now
@@ -548,9 +611,11 @@ def train(
             running_loss = 0.0
             start_time = time.time()
 
+         # Call this after logging
          optimizer.step()
+         optimizer.zero_grad(set_to_none=True)
 
-      print(f"epoch {epoch_num:5d}| global step: {global_step:5d} | avg epoch loss: {1.0 * epoch_loss/training_step}")
+      print(f"epoch {epoch_num:5d} | global step: {global_step:5d} | avg epoch loss: {1.0 * epoch_loss/training_step}")
 
 
 if __name__ == "__main__":
@@ -562,44 +627,38 @@ if __name__ == "__main__":
 
    # Model
    model = ActionRecognitionModel(
-      input_dims=(8, 240, 320),
+      input_dims=(8, 128, 128),
       num_classes=101,
       blocks=[
-         ModelBlock(
-            **{
-               "num_convs": 3,
-               "nonlin": "relu",
-               "conv3d_params": {
-                  "in_channels": 3,
-                  "out_channels": 64
-               },
-               "maxpool3d_params": {}
-            },
+         VGGBlockParams(
+            num_convs=3,
+            conv3d_params=Conv3dParams(
+               in_channels=3,
+               out_channels=64
+            ),
+            nonlin="relu",
+            maxpool3d_params=MaxPool3dParams(),
          ),
-         ModelBlock(
-            **{
-               "num_convs": 3,
-               "nonlin": "relu",
-               "conv3d_params": {
-                  "in_channels": 64,
-                  "out_channels": 32
-               },
-               "maxpool3d_params": {}
-            }
+         VGGBlockParams(
+            num_convs=3,
+            conv3d_params=Conv3dParams(
+               in_channels=64,
+               out_channels=32
+            ),
+            nonlin="relu",
+            maxpool3d_params=MaxPool3dParams(),
          ),
-         ModelBlock(
-            **{
-               "num_convs": 3,
-               "nonlin": "relu",
-               "conv3d_params": {
-                  "in_channels": 32,
-                  "out_channels": 8,
-                  "kernel_size": (2,5,5),
-               },
-               "maxpool3d_params": {}
-            }
-         ),
-      ]
+         VGGBlockParams(
+            num_convs=3,
+            conv3d_params=Conv3dParams(
+               in_channels=32,
+               out_channels=8,
+               kernel_size=(2,3,3)
+            ),
+            nonlin="relu",
+            maxpool3d_params=MaxPool3dParams(),
+         )
+      ],
    )
    model, activations = create_activations_forward_hooks(model)
    model.to(device)
